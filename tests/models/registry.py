@@ -452,6 +452,13 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "mistralai/Mixtral-8x7B-Instruct-v0.1",
         {"tiny": "TitanML/tiny-mixtral"},
     ),
+    "NCPOlmo3ForCausalLM": _HfExamplesInfo(
+        "",
+        enforce_eager=True,
+        enable_prefix_caching=False,
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
     "NemotronForCausalLM": _HfExamplesInfo("nvidia/Minitron-8B-Base"),
     "NemotronHForCausalLM": _HfExamplesInfo(
         "nvidia/Nemotron-H-8B-Base-8K", trust_remote_code=True
