@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import nullcontext
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import torch
@@ -100,6 +100,210 @@ def _dflash_sdpa_mask(
     )
 
 
+def _dflash_cached_context_kv_rows(
+    layer: torch.nn.Module,
+    context: torch.Tensor,
+    anchor_positions: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Return request-local context KV rows, projecting only new suffixes.
+
+    The final target context row is the unprocessed anchor placeholder. Rows
+    strictly before it are immutable, so their projected K/V may be retained
+    across decode steps. New suffixes from all active requests are packed into
+    one projection to preserve batching after request removal or row reorder.
+    """
+
+    batch_size, supplied_length, _ = context.shape
+    request_ids = getattr(layer, "_ncp_dflash_request_ids", None)
+    causal_lengths = getattr(layer, "_ncp_dflash_causal_lengths", None)
+    if request_ids is None or causal_lengths is None:
+        raise ValueError("NCP DFlash context KV cache metadata is missing")
+    if len(request_ids) != batch_size or len(causal_lengths) != batch_size:
+        raise ValueError("NCP DFlash context KV cache metadata is misaligned")
+    context_offsets = getattr(layer, "_ncp_dflash_context_offsets", None)
+    if context_offsets is not None and len(context_offsets) != batch_size:
+        raise ValueError("NCP DFlash context offsets are misaligned")
+    if int(anchor_positions.shape[0]) != batch_size:
+        raise ValueError("NCP DFlash anchor positions are misaligned")
+
+    cache = getattr(layer, "_ncp_dflash_context_kv_cache", None)
+    if cache is None:
+        cache = {}
+        layer._ncp_dflash_context_kv_cache = cache
+    projection_dtype = getattr(layer.k_proj.weight, "dtype", context.dtype)
+    empty_shape = (1, layer.num_attention_heads, 0, layer.head_size)
+    records: list[tuple[str, int, int, torch.Tensor, torch.Tensor]] = []
+    suffixes: list[torch.Tensor] = []
+    suffix_positions: list[torch.Tensor] = []
+    suffix_lengths: list[int] = []
+
+    for row_index, raw_request_id in enumerate(request_ids):
+        request_id = str(raw_request_id)
+        causal_length = int(causal_lengths[row_index])
+        context_offset = (
+            0 if context_offsets is None else int(context_offsets[row_index])
+        )
+        if not (
+            0 <= context_offset <= causal_length
+            and causal_length - context_offset <= supplied_length
+        ):
+            raise ValueError(
+                "NCP DFlash causal context is outside the supplied slice: "
+                f"request={request_id!r} offset={context_offset} "
+                f"causal={causal_length} supplied={supplied_length}"
+            )
+
+        cached = cache.get(request_id)
+        if cached is None:
+            cached_length = 0
+            cached_key = torch.empty(
+                empty_shape,
+                device=context.device,
+                dtype=projection_dtype,
+            )
+            cached_value = cached_key.clone()
+        else:
+            cached_length, cached_key, cached_value = cached
+            if (
+                int(cached_length) > causal_length
+                or cached_key.device != context.device
+                or cached_key.dtype != projection_dtype
+            ):
+                cached_length = 0
+                cached_key = torch.empty(
+                    empty_shape,
+                    device=context.device,
+                    dtype=projection_dtype,
+                )
+                cached_value = cached_key.clone()
+
+        suffix_length = causal_length - int(cached_length)
+        if suffix_length:
+            if int(cached_length) < context_offset:
+                raise RuntimeError(
+                    "NCP DFlash compact context starts after its valid cache: "
+                    f"request={request_id!r} cached={cached_length} "
+                    f"offset={context_offset}"
+                )
+            relative_start = int(cached_length) - context_offset
+            relative_end = causal_length - context_offset
+            suffixes.append(context[row_index, relative_start:relative_end])
+            suffix_positions.append(
+                torch.arange(
+                    int(cached_length),
+                    causal_length,
+                    device=context.device,
+                )
+            )
+            suffix_lengths.append(suffix_length)
+        records.append(
+            (
+                request_id,
+                causal_length,
+                suffix_length,
+                cached_key,
+                cached_value,
+            )
+        )
+
+    projected_keys: list[torch.Tensor] = []
+    projected_values: list[torch.Tensor] = []
+    if suffixes:
+        packed_suffix = torch.cat(suffixes, dim=0).unsqueeze(0)
+        packed_positions = torch.cat(suffix_positions, dim=0).unsqueeze(0)
+        packed_key = layer._split_heads(layer.k_norm(layer.k_proj(packed_suffix)))
+        packed_value = layer._split_heads(layer.v_proj(packed_suffix))
+        packed_key = layer.rotary(packed_key, packed_positions).transpose(1, 2)
+        packed_value = packed_value.transpose(1, 2)
+        projected_keys = list(torch.split(packed_key, suffix_lengths, dim=2))
+        projected_values = list(torch.split(packed_value, suffix_lengths, dim=2))
+
+    keys: list[torch.Tensor] = []
+    values: list[torch.Tensor] = []
+    projected_index = 0
+    for request_id, causal_length, suffix_length, cached_key, cached_value in records:
+        if suffix_length:
+            required_length = causal_length
+            capacity = int(cached_key.shape[2])
+            if required_length > capacity:
+                target_capacity = max(16, required_length, capacity * 2)
+                new_capacity = 1 << (target_capacity - 1).bit_length()
+                key_storage = cached_key.new_empty(
+                    (
+                        1,
+                        layer.num_attention_heads,
+                        new_capacity,
+                        layer.head_size,
+                    )
+                )
+                value_storage = cached_value.new_empty(key_storage.shape)
+                cached_prefix = required_length - suffix_length
+                if cached_prefix:
+                    key_storage[:, :, :cached_prefix].copy_(
+                        cached_key[:, :, :cached_prefix]
+                    )
+                    value_storage[:, :, :cached_prefix].copy_(
+                        cached_value[:, :, :cached_prefix]
+                    )
+                cached_key = key_storage
+                cached_value = value_storage
+            suffix_start = required_length - suffix_length
+            cached_key[:, :, suffix_start:required_length].copy_(
+                projected_keys[projected_index].to(dtype=cached_key.dtype)
+            )
+            cached_value[:, :, suffix_start:required_length].copy_(
+                projected_values[projected_index].to(dtype=cached_value.dtype)
+            )
+            projected_index += 1
+        cache[request_id] = (
+            causal_length,
+            cached_key.detach(),
+            cached_value.detach(),
+        )
+        keys.append(cached_key[:, :, :causal_length])
+        values.append(cached_value[:, :, :causal_length])
+    if projected_index != len(projected_keys):
+        raise RuntimeError("NCP DFlash context KV suffix accounting drifted")
+    return keys, values
+
+
+def _dflash_context_kv(
+    layer: torch.nn.Module,
+    context: torch.Tensor,
+    anchor_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return padded context K/V, reusing request-local rows when enabled."""
+
+    batch_size, supplied_length, _ = context.shape
+    causal_lengths = getattr(layer, "_ncp_dflash_causal_lengths", None)
+    sequence_length = (
+        max((int(length) for length in causal_lengths), default=0)
+        if causal_lengths is not None
+        else supplied_length
+    )
+    request_ids = getattr(layer, "_ncp_dflash_request_ids", None)
+    if request_ids is None:
+        positions = torch.arange(sequence_length, device=context.device)
+        positions = positions.view(1, sequence_length).expand(batch_size, -1)
+        context_key = layer._split_heads(layer.k_norm(layer.k_proj(context)))
+        context_value = layer._split_heads(layer.v_proj(context))
+        context_key = layer.rotary(context_key, positions).transpose(1, 2)
+        return context_key, context_value.transpose(1, 2)
+
+    key_rows, value_rows = _dflash_cached_context_kv_rows(
+        layer,
+        context,
+        anchor_positions,
+    )
+    keys = []
+    values = []
+    for key, value in zip(key_rows, value_rows, strict=True):
+        padding = sequence_length - int(key.shape[2])
+        keys.append(key if padding == 0 else F.pad(key, (0, 0, 0, padding)))
+        values.append(value if padding == 0 else F.pad(value, (0, 0, 0, padding)))
+    return torch.cat(keys, dim=0), torch.cat(values, dim=0)
+
+
 def _sdpa_dflash_attention(
     layer: torch.nn.Module,
     slots: torch.Tensor,
@@ -111,7 +315,12 @@ def _sdpa_dflash_attention(
 
     del block_mask
     batch_size, anchor_count, block_size, hidden_size = slots.shape
-    context_length = int(context.shape[1])
+    causal_lengths = getattr(layer, "_ncp_dflash_causal_lengths", None)
+    context_length = (
+        max((int(length) for length in causal_lengths), default=0)
+        if causal_lengths is not None
+        else int(context.shape[1])
+    )
     slot_positions = anchor_positions.clamp(min=0).unsqueeze(-1) + torch.arange(
         block_size,
         device=slots.device,
@@ -123,15 +332,11 @@ def _sdpa_dflash_attention(
     query = layer.rotary(query, slot_positions)
     slot_key = layer.rotary(slot_key, slot_positions)
 
-    context_positions = torch.arange(context_length, device=context.device)
-    context_positions = context_positions.view(1, context_length).expand(
-        batch_size,
-        -1,
+    context_key, context_value = _dflash_context_kv(
+        layer,
+        context,
+        anchor_positions,
     )
-    context_key = layer._split_heads(layer.k_norm(layer.k_proj(context)))
-    context_value = layer._split_heads(layer.v_proj(context))
-    context_key = layer.rotary(context_key, context_positions).transpose(1, 2)
-    context_value = context_value.transpose(1, 2)
 
     query_length = anchor_count * block_size
     query = (
@@ -251,6 +456,17 @@ class NCPDFlashSpeculator(BaseSpeculator):
             raw_active_batch_widths,
             self.num_speculative_steps,
         )
+        self.context_kv_cache = (
+            os.environ.get("NCP_OLMO_DFLASH_CONTEXT_KV_CACHE", "1") == "1"
+        )
+        self.sparse_context_projection = (
+            os.environ.get("NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION", "1")
+            == "1"
+        )
+        if self.sparse_context_projection and not self.context_kv_cache:
+            raise ValueError(
+                "NCP DFlash sparse context projection requires context KV cache"
+            )
         self.chunk_size = int(self.draft_config.concept_chunk_size)
         self.draft_tokens = torch.full(
             (self.max_num_reqs, self.num_speculative_steps),
@@ -266,10 +482,13 @@ class NCPDFlashSpeculator(BaseSpeculator):
         self._logged_first_proposal = False
         logger.info(
             "NCP DFlash enabled with verification_mode=%s, proposal_width=%d, "
-            "and active_batch_widths=%s",
+            "active_batch_widths=%s, context_kv_cache=%s, and "
+            "sparse_context_projection=%s",
             self.verification_mode,
             self.num_speculative_steps,
             self.active_batch_widths or "static",
+            self.context_kv_cache,
+            self.sparse_context_projection,
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -307,6 +526,10 @@ class NCPDFlashSpeculator(BaseSpeculator):
             raise ValueError(
                 "loaded draft block_size is smaller than the proposal width"
             )
+        self._draft_runtime_max_block_size = min(
+            int(model.config.block_size),
+            self.num_speculative_steps,
+        )
         if str(model.config.proposal_method) != "path_selector":
             raise ValueError("loaded NCP drafter must use path_selector")
         if str(model.config.hlm_conditioning) != "causal_residual":
@@ -369,6 +592,152 @@ class NCPDFlashSpeculator(BaseSpeculator):
             padding = max_length - int(context.shape[1])
             padded.append(torch.nn.functional.pad(context, (0, 0, 0, 0, 0, padding)))
         return torch.cat(padded, dim=0)
+
+    @staticmethod
+    def _valid_cached_context_length(
+        layer: torch.nn.Module,
+        request_id: str,
+        *,
+        causal_length: int,
+        device: torch.device,
+    ) -> int:
+        cache = getattr(layer, "_ncp_dflash_context_kv_cache", None)
+        cached = None if cache is None else cache.get(str(request_id))
+        if cached is None:
+            return 0
+        cached_length, cached_key, _ = cached
+        projection_dtype = getattr(layer.k_proj.weight, "dtype", cached_key.dtype)
+        if (
+            int(cached_length) > int(causal_length)
+            or cached_key.device != device
+            or cached_key.dtype != projection_dtype
+        ):
+            return 0
+        return int(cached_length)
+
+    def _forward_sparse_context(
+        self,
+        draft: torch.nn.Module,
+        contexts: list[torch.Tensor],
+        *,
+        request_ids: list[str],
+        prefix_lengths: list[int],
+        anchor_embeddings: torch.Tensor,
+        mask_embedding: torch.Tensor,
+        anchor_positions: torch.Tensor,
+        hlm_hidden_states: torch.Tensor,
+    ) -> Any:
+        """Run the remote drafter using only uncached context suffixes."""
+
+        batch_size = len(contexts)
+        if not (len(request_ids) == batch_size == len(prefix_lengths)):
+            raise ValueError("NCP DFlash sparse context metadata is misaligned")
+        suffix_starts: list[int] = []
+        suffixes: list[torch.Tensor] = []
+        suffix_lengths: list[int] = []
+        for row_index, (request_id, prefix_length) in enumerate(
+            zip(request_ids, prefix_lengths, strict=True)
+        ):
+            causal_length = int(prefix_length) - 1
+            cached_lengths = [
+                self._valid_cached_context_length(
+                    layer,
+                    request_id,
+                    causal_length=causal_length,
+                    device=contexts[row_index].device,
+                )
+                for layer in draft.layers
+            ]
+            suffix_start = min(cached_lengths, default=0)
+            suffix_length = causal_length - suffix_start
+            suffix_starts.append(suffix_start)
+            suffix_lengths.append(suffix_length)
+            if suffix_length:
+                suffixes.append(
+                    contexts[row_index][0, suffix_start:causal_length]
+                )
+
+        hidden_size = int(draft.config.draft_hidden_size)
+        if suffixes:
+            packed_features = torch.cat(suffixes, dim=0)
+            shared_suffix = draft.feature_norm(
+                draft.feature_projection(packed_features.flatten(start_dim=1))
+            )
+            layer_suffixes = [
+                draft._context_for_layer(
+                    packed_features.unsqueeze(0),
+                    shared_suffix.unsqueeze(0),
+                    layer_index,
+                ).squeeze(0)
+                for layer_index in range(len(draft.layers))
+            ]
+        else:
+            layer_suffixes = [
+                anchor_embeddings.new_empty((0, hidden_size))
+                for _ in draft.layers
+            ]
+
+        compact_length = max(suffix_lengths, default=0)
+        block_size = int(draft.config.block_size)
+        mask_slots = mask_embedding.view(1, 1, 1, -1).expand(
+            batch_size,
+            int(anchor_embeddings.shape[1]),
+            block_size - 1,
+            -1,
+        )
+        target_slots = torch.cat((anchor_embeddings.unsqueeze(2), mask_slots), dim=2)
+        slots = draft.input_projection(target_slots)
+        uniform_suffix_length = (
+            suffix_lengths[0]
+            if suffix_lengths
+            and all(length == suffix_lengths[0] for length in suffix_lengths)
+            else None
+        )
+        for layer_index, layer in enumerate(draft.layers):
+            layer._ncp_dflash_context_offsets = suffix_starts
+            if uniform_suffix_length is not None:
+                layer_context = layer_suffixes[layer_index].reshape(
+                    batch_size,
+                    uniform_suffix_length,
+                    hidden_size,
+                )
+            else:
+                layer_context = slots.new_zeros(
+                    (batch_size, compact_length, hidden_size)
+                )
+                packed_offset = 0
+                for row_index, suffix_length in enumerate(suffix_lengths):
+                    if suffix_length:
+                        layer_context[row_index, :suffix_length] = layer_suffixes[
+                            layer_index
+                        ][packed_offset : packed_offset + suffix_length]
+                    packed_offset += suffix_length
+            layer_hlm = draft._hlm_for_layer(
+                hlm_hidden_states,
+                slots,
+                layer_index,
+            )
+            slots = layer(
+                slots,
+                layer_context,
+                layer_hlm,
+                anchor_positions,
+                None,
+            )
+        hidden = draft.output_projection(draft.final_norm(slots))
+        return SimpleNamespace(last_hidden_state=hidden)
+
+    def _prune_context_kv_cache(self, request_ids: list[str]) -> None:
+        if not self.context_kv_cache or self._draft_model is None:
+            return
+        active_request_ids = {str(request_id) for request_id in request_ids}
+        for layer in self._draft_model.layers:
+            cache = getattr(layer, "_ncp_dflash_context_kv_cache", None)
+            if cache is None:
+                continue
+            for request_id in tuple(cache):
+                if request_id not in active_request_ids:
+                    del cache[request_id]
 
     @staticmethod
     def _path_selector_batch(
@@ -479,6 +848,17 @@ class NCPDFlashSpeculator(BaseSpeculator):
         draft = self._load_draft()
         if int(draft.config.vocab_size) != int(embedding_weight.shape[0]):
             raise ValueError("NCP target and draft vocabulary sizes do not match")
+        proposal_block_size = max(proposal_counts)
+        runtime_max_block_size = int(self._draft_runtime_max_block_size)
+        if not 0 < proposal_block_size <= runtime_max_block_size:
+            raise RuntimeError(
+                "NCP DFlash proposal block exceeds the loaded runtime block: "
+                f"proposal={proposal_block_size} runtime={runtime_max_block_size}"
+            )
+        # The remote drafter constructs its slot tensor from config.block_size.
+        # Compute only the width selected for this scheduler step instead of
+        # the checkpoint's full trained block and discarding the suffix.
+        draft.config.block_size = proposal_block_size
         anchor_embeddings = embedding_weight[anchor_ids].unsqueeze(1)
         mask_embedding = embedding_weight[int(draft.config.mask_token_id)]
         anchor_positions = torch.tensor(
@@ -497,16 +877,45 @@ class NCPDFlashSpeculator(BaseSpeculator):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+        for layer in draft.layers:
+            if self.context_kv_cache:
+                layer._ncp_dflash_request_ids = request_ids
+                layer._ncp_dflash_causal_lengths = [
+                    prefix_length - 1 for prefix_length in prefix_lengths
+                ]
+                layer._ncp_dflash_context_offsets = None
         with torch.inference_mode(), autocast:
-            output = draft(
-                aux_hidden_states=self._pad_context_batch(contexts),
-                anchor_embeddings=anchor_embeddings,
-                mask_embedding=mask_embedding,
-                anchor_positions=anchor_positions,
-                sequence_lengths=sequence_lengths,
-                hlm_hidden_states=torch.cat(hlm_states, dim=0),
-                return_dict=True,
-            )
+            try:
+                if self.sparse_context_projection:
+                    output = self._forward_sparse_context(
+                        draft,
+                        contexts,
+                        request_ids=request_ids,
+                        prefix_lengths=prefix_lengths,
+                        anchor_embeddings=anchor_embeddings,
+                        mask_embedding=mask_embedding,
+                        anchor_positions=anchor_positions,
+                        hlm_hidden_states=torch.cat(hlm_states, dim=0),
+                    )
+                else:
+                    output = draft(
+                        aux_hidden_states=self._pad_context_batch(contexts),
+                        anchor_embeddings=anchor_embeddings,
+                        mask_embedding=mask_embedding,
+                        anchor_positions=anchor_positions,
+                        sequence_lengths=sequence_lengths,
+                        hlm_hidden_states=torch.cat(hlm_states, dim=0),
+                        return_dict=True,
+                    )
+            finally:
+                for layer in draft.layers:
+                    for attribute in (
+                        "_ncp_dflash_request_ids",
+                        "_ncp_dflash_causal_lengths",
+                        "_ncp_dflash_context_offsets",
+                    ):
+                        if hasattr(layer, attribute):
+                            delattr(layer, attribute)
             return self._path_selector_batch(
                 draft,
                 output.last_hidden_state[:, 0],
@@ -565,6 +974,10 @@ class NCPDFlashSpeculator(BaseSpeculator):
             # Use valid synthetic IDs; no warmup output is user-visible.
             result.zero_()
             return result
+
+        self._prune_context_kv_cache(
+            [str(request_id) for request_id in input_batch.req_ids]
+        )
 
         sampled_counts = num_sampled[:num_reqs].detach().cpu().tolist()
         active_decode_batch_size = sum(

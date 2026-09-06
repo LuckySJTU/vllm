@@ -17,10 +17,41 @@ from vllm.model_executor.models.ncp_olmo.dflash import (
 )
 from vllm.v1.worker.gpu.spec_decode.ncp_dflash import (
     NCPDFlashSpeculator,
+    _dflash_context_kv,
     _dflash_sdpa_mask,
     _parse_active_batch_widths,
 )
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+
+
+class _CountingProjection(torch.nn.Linear):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__(hidden_size, hidden_size, bias=False)
+        self.call_count = 0
+        self.projected_tokens = 0
+        with torch.no_grad():
+            self.weight.copy_(torch.eye(hidden_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.call_count += 1
+        self.projected_tokens += int(
+            hidden_states.numel() // hidden_states.shape[-1]
+        )
+        return super().forward(hidden_states)
+
+
+def _context_kv_test_layer() -> SimpleNamespace:
+    hidden_size = 4
+    layer = SimpleNamespace(
+        num_attention_heads=2,
+        head_size=2,
+        k_proj=_CountingProjection(hidden_size),
+        v_proj=_CountingProjection(hidden_size),
+        k_norm=torch.nn.Identity(),
+    )
+    layer._split_heads = lambda hidden: hidden.unflatten(-1, (2, 2))
+    layer.rotary = lambda hidden, positions: hidden
+    return layer
 
 
 def make_config(**draft_overrides: object) -> SimpleNamespace:
@@ -164,6 +195,65 @@ def test_sdpa_mask_matches_dflash_context_and_block_visibility() -> None:
         [True, True, False, False, True, True],
         [True, True, False, False, True, True],
     ]
+
+
+def test_context_kv_cache_survives_continuous_batch_row_reorder() -> None:
+    layer = _context_kv_test_layer()
+    layer._ncp_dflash_request_ids = ["request-a", "request-b"]
+    layer._ncp_dflash_causal_lengths = [3, 2]
+    first = torch.zeros(2, 4, 4)
+    first[0, :3] = torch.tensor([[1.0] * 4, [2.0] * 4, [3.0] * 4])
+    first[1, :2] = torch.tensor([[10.0] * 4, [11.0] * 4])
+
+    _dflash_context_kv(layer, first, torch.tensor([[3], [2]]))
+
+    assert layer.k_proj.projected_tokens == 5
+    assert layer.k_proj.call_count == 1
+
+    second = torch.zeros(2, 5, 4)
+    second[0, :3] = torch.tensor([[10.0] * 4, [11.0] * 4, [12.0] * 4])
+    second[1, :4] = torch.tensor(
+        [[1.0] * 4, [2.0] * 4, [3.0] * 4, [4.0] * 4]
+    )
+    layer._ncp_dflash_request_ids = ["request-b", "request-a"]
+    layer._ncp_dflash_causal_lengths = [3, 4]
+    cached_key, cached_value = _dflash_context_kv(
+        layer,
+        second,
+        torch.tensor([[3], [4]]),
+    )
+
+    assert layer.k_proj.projected_tokens == 7
+    assert layer.v_proj.projected_tokens == 7
+    assert layer.k_proj.call_count == 2
+    reference = _context_kv_test_layer()
+    expected_key, expected_value = _dflash_context_kv(
+        reference,
+        second[:, :4],
+        torch.tensor([[3], [4]]),
+    )
+    torch.testing.assert_close(cached_key, expected_key)
+    torch.testing.assert_close(cached_value, expected_value)
+    assert set(layer._ncp_dflash_context_kv_cache) == {
+        "request-a",
+        "request-b",
+    }
+
+
+def test_context_kv_cache_prunes_released_requests() -> None:
+    speculator = object.__new__(NCPDFlashSpeculator)
+    speculator.context_kv_cache = True
+    layer = SimpleNamespace(
+        _ncp_dflash_context_kv_cache={
+            "request-a": object(),
+            "request-b": object(),
+        }
+    )
+    speculator._draft_model = SimpleNamespace(layers=[layer])
+
+    speculator._prune_context_kv_cache(["request-b"])
+
+    assert set(layer._ncp_dflash_context_kv_cache) == {"request-b"}
 
 
 def test_variable_draft_rows_trim_only_invalid_suffixes() -> None:
