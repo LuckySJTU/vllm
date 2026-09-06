@@ -12,6 +12,7 @@ from vllm import SamplingParams
 from ...utils import check_logprobs_close, check_outputs_equal
 
 MODEL = os.environ.get("NCP_OLMO_TEST_MODEL", "")
+DFLASH_MODEL = os.environ.get("NCP_OLMO_DFLASH_TEST_MODEL", "")
 PROMPTS = [
     "A short request checks the model state.",
     "A longer request checks that batching preserves the request-local HLM state. " * 8,
@@ -254,3 +255,68 @@ def test_chunked_prefill_preemption_and_refill_match_sequential(
         0,
     )
     assert preemptions_after > preemptions_before
+@pytest.mark.skipif(
+    not DFLASH_MODEL,
+    reason="NCP_OLMO_DFLASH_TEST_MODEL must point to the matching draft checkpoint",
+)
+def test_dflash_continuous_refill_matches_target_only(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_runner,
+) -> None:
+    """A finished slot is refilled while a longer request remains active."""
+
+    prompts = [
+        "A",
+        "Continue this longer request with a few factual words.",
+        "B",
+        "Write a short sentence about Paris.",
+        "C",
+    ]
+    max_tokens = [1, 12, 2, 8, 3]
+    sampling_params = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=count,
+            ignore_eos=True,
+        )
+        for count in max_tokens
+    ]
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
+    def generate(speculative_config: dict[str, object] | None) -> list[list[int]]:
+        with vllm_runner(
+            MODEL,
+            dtype="bfloat16",
+            max_num_seqs=2,
+            enforce_eager=True,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            speculative_config=speculative_config,
+            kernel_config={
+                "enable_jit_warmup": False,
+                "enable_cutedsl_warmup": False,
+            },
+        ) as model:
+            outputs = model.llm.generate(
+                prompts,
+                sampling_params,
+                use_tqdm=False,
+            )
+        return [list(output.outputs[0].token_ids) for output in outputs]
+
+    target_only = generate(None)
+    monkeypatch.setenv("NCP_OLMO_DFLASH_VERIFICATION_MODE", "sequential_exact")
+    monkeypatch.setenv(
+        "NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS",
+        "1:8,2:8,4:4,8:2",
+    )
+    with_dflash = generate(
+        {
+            "model": DFLASH_MODEL,
+            "method": "dflash",
+            "num_speculative_tokens": 8,
+        }
+    )
+
+    assert [len(output) for output in with_dflash] == max_tokens
+    assert with_dflash == target_only

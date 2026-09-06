@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,15 +20,24 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import HasInnerState
 
 from .contract import NCPOlmo3BackendConfig
+from .dflash import (
+    is_ncp_dflash_config,
+    original_draft_config,
+    register_ncp_dflash_target,
+    validate_ncp_dflash_config,
+)
 from .hlm import ConceptLMHighLevelBranch
 from .routes import NCPOlmo3Routes
 from .state import (
     ConceptRequestState,
     ConceptRequestStateStore,
+    RequestStateSnapshot,
     ScheduledRequestSegment,
     active_tensor_buffer,
     append_tensor_buffer,
     clear_tensor_buffer,
+    restore_request_state,
+    snapshot_request_state,
 )
 from .token_tower import ConceptLMTokenBackbone, _config_value
 from .weights import (
@@ -45,16 +55,27 @@ _HLMAdvance = tuple[
 
 
 def _chunk_mean(values: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    """Pool token chunks and restore the activation dtype.
+    """Pool token chunks without leaking reduction accumulator dtype.
 
-    Batch-invariant mode accumulates reductions in FP32. The HLM consumes model
-    activations, so pooling must return to the input dtype before LayerNorm and
-    QKV projections.
+    vLLM batch-invariant mode intentionally accumulates ``aten::mean`` in
+    FP32.  NCP's HLM consumes model activations, so the pooled chunks must be
+    converted back to the activation dtype before LayerNorm and QKV linear.
     """
 
     hidden_size = int(values.shape[-1])
     pooled = values.reshape(-1, chunk_size, hidden_size).mean(dim=1)
     return pooled.to(values.dtype)
+
+
+@dataclass
+class _DFlashStateTransaction:
+    """Target-state mutation staged until rejection sampling completes."""
+
+    segment: ScheduledRequestSegment
+    snapshot: RequestStateSnapshot | None
+    encoder_final: torch.Tensor | None = None
+    encoder_layers: tuple[torch.Tensor, ...] = ()
+    decoder_layers: tuple[torch.Tensor, ...] = ()
 
 
 class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
@@ -85,15 +106,25 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
                 "NCP-ArchPreview request-scoped HLM requires prefix caching to be "
                 "disabled"
             )
-        if vllm_config.speculative_config is not None:
+        self._ncp_dflash_enabled = is_ncp_dflash_config(vllm_config)
+        if vllm_config.speculative_config is not None and not self._ncp_dflash_enabled:
             raise NotImplementedError(
-                "speculative decoding is not enabled before target-model parity"
+                "NCP-OLMo only supports its matching conceptlm_dflash checkpoint"
             )
         if vllm_config.quant_config is not None:
             raise NotImplementedError(
                 "quantized NCP-ArchPreview checkpoints are not enabled in the "
                 "first backend"
             )
+
+        if self._ncp_dflash_enabled:
+            draft_capture_layer_ids = validate_ncp_dflash_config(vllm_config)
+            draft_config = original_draft_config(vllm_config)
+            draft_chunk_size = int(draft_config.concept_chunk_size)
+        else:
+            draft_capture_layer_ids = ()
+            draft_chunk_size = None
+        self._draft_capture_layer_ids = draft_capture_layer_ids
 
         hf_config = vllm_config.model_config.hf_config
         raw_config = (
@@ -103,6 +134,22 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
         )
         self.backend_config = NCPOlmo3BackendConfig.from_mapping(raw_config)
         self.ncp_weight_config = NCPOlmo3WeightConfig.from_mapping(raw_config)
+        if self._ncp_dflash_enabled:
+            if draft_chunk_size != self.backend_config.chunk_size:
+                raise ValueError(
+                    "NCP target and DFlash concept_chunk_size do not match: "
+                    f"{self.backend_config.chunk_size} != {draft_chunk_size}"
+                )
+            invalid_layers = [
+                layer_id
+                for layer_id in self._draft_capture_layer_ids
+                if not 0 <= layer_id < self.backend_config.decoder_layers
+            ]
+            if invalid_layers:
+                raise ValueError(
+                    "NCP DFlash target_layer_ids are outside the target decoder: "
+                    f"{invalid_layers!r}"
+                )
         epsilon = float(_config_value(hf_config, "layernorm_epsilon"))
         self.token_backbone = ConceptLMTokenBackbone(
             vllm_config=vllm_config,
@@ -119,11 +166,16 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
         self.request_states = ConceptRequestStateStore(
             encoder_layers=self.backend_config.encoder_layers,
             hlm_layers=self.backend_config.hlm_layers,
+            speculative_chunk_size=draft_chunk_size,
+            draft_layers=len(self._draft_capture_layer_ids),
         )
+        self._dflash_transactions: dict[str, _DFlashStateTransaction] = {}
         self._logits_trace_index = 0
         self._pending_stage_trace: dict[str, torch.Tensor] | None = None
         trace_dir = os.environ.get("CONCEPTLM_VLLM_LOGITS_TRACE_DIR")
         self._logits_trace_dir = Path(trace_dir) if trace_dir else None
+        if self._ncp_dflash_enabled:
+            register_ncp_dflash_target(self)
 
     @staticmethod
     def get_model_state_cls() -> type[Any]:
@@ -138,11 +190,244 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
 
         return self.token_backbone.embed_input_ids(input_ids)
 
+    def begin_dflash_transactions(
+        self,
+        segments: Sequence[ScheduledRequestSegment],
+        draft_counts: Sequence[int] | None,
+    ) -> None:
+        """Snapshot request-local state before a speculative verifier pass."""
+
+        if not self._ncp_dflash_enabled or draft_counts is None:
+            return
+        if self._dflash_transactions:
+            raise RuntimeError(
+                "NCP DFlash transactions were not finalized before the next pass: "
+                f"{sorted(self._dflash_transactions)}"
+            )
+        if len(segments) != len(draft_counts):
+            raise RuntimeError("NCP DFlash segments and draft counts are misaligned")
+
+        chunk_size = self.backend_config.chunk_size
+        for segment, raw_draft_count in zip(segments, draft_counts, strict=True):
+            draft_count = int(raw_draft_count)
+            if draft_count <= 0:
+                continue
+            segment_length = segment.position_end - segment.position_start
+            if segment_length != draft_count + 1:
+                raise RuntimeError(
+                    "NCP DFlash verifier segment does not match scheduled drafts: "
+                    f"request={segment.req_id} segment={segment_length} "
+                    f"drafts={draft_count}"
+                )
+            crosses_chunk_boundary = (
+                segment.position_start // chunk_size
+                != segment.position_end // chunk_size
+            )
+            self._dflash_transactions[segment.req_id] = _DFlashStateTransaction(
+                segment=segment,
+                snapshot=(
+                    snapshot_request_state(segment.state)
+                    if crosses_chunk_boundary
+                    else None
+                ),
+            )
+
+    def _record_dflash_transaction_features(
+        self,
+        segment: ScheduledRequestSegment,
+        encoder_hidden: torch.Tensor,
+        encoder_raw_layers: Sequence[torch.Tensor],
+        draft_layer_outputs: dict[int, torch.Tensor],
+    ) -> None:
+        transaction = self._dflash_transactions.get(segment.req_id)
+        if transaction is None or transaction.snapshot is None:
+            return
+        token_slice = slice(segment.flat_start, segment.flat_end)
+        transaction.encoder_final = encoder_hidden[token_slice].detach()
+        transaction.encoder_layers = tuple(
+            values[token_slice].detach() for values in encoder_raw_layers
+        )
+        transaction.decoder_layers = tuple(
+            draft_layer_outputs[layer_id][token_slice].detach()
+            for layer_id in self._draft_capture_layer_ids
+        )
+
+    def finalize_dflash_transactions(
+        self,
+        request_ids: Sequence[str],
+        num_sampled: torch.Tensor,
+        *,
+        force_full: bool = False,
+    ) -> None:
+        """Commit only the target prefix accepted by rejection sampling."""
+
+        if not self._dflash_transactions:
+            return
+        if len(request_ids) > int(num_sampled.shape[0]):
+            raise RuntimeError("NCP DFlash sampled rows are shorter than the batch")
+        accepted_counts = num_sampled[: len(request_ids)].detach().cpu().tolist()
+        accepted_by_request = {
+            str(req_id): int(count)
+            for req_id, count in zip(request_ids, accepted_counts, strict=True)
+        }
+
+        replay: list[tuple[_DFlashStateTransaction, ScheduledRequestSegment, int]] = []
+        hlm_advances: list[_HLMAdvance] = []
+        for req_id, transaction in tuple(self._dflash_transactions.items()):
+            if req_id not in accepted_by_request:
+                raise RuntimeError(f"NCP DFlash verifier omitted request {req_id!r}")
+            segment = transaction.segment
+            segment_length = segment.position_end - segment.position_start
+            accepted_input_count = (
+                segment_length if force_full else accepted_by_request[req_id]
+            )
+            if accepted_input_count == 0:
+                # vLLM clears a sampled row when the request reaches a stop
+                # condition. No later proposal can observe its request-local state.
+                del self._dflash_transactions[req_id]
+                continue
+            if not 0 < accepted_input_count <= segment_length:
+                raise RuntimeError(
+                    "NCP DFlash accepted prefix is outside its verifier segment: "
+                    f"request={req_id} accepted={accepted_input_count} "
+                    f"segment_length={segment_length}"
+                )
+            if accepted_input_count == segment_length:
+                if segment.state.next_token_position != segment.position_end:
+                    raise RuntimeError(
+                        f"fully accepted DFlash state is not committed for {req_id!r}"
+                    )
+                del self._dflash_transactions[req_id]
+                continue
+
+            accepted_position = segment.position_start + accepted_input_count
+            if transaction.snapshot is None:
+                self.request_states.rollback_speculative_suffix(
+                    segment.state,
+                    accepted_position,
+                )
+                del self._dflash_transactions[req_id]
+                continue
+
+            if (
+                transaction.encoder_final is None
+                or not transaction.encoder_layers
+                or len(transaction.decoder_layers)
+                != len(self._draft_capture_layer_ids)
+            ):
+                raise RuntimeError(
+                    f"NCP DFlash transaction features are incomplete for {req_id!r}"
+                )
+            restore_request_state(segment.state, transaction.snapshot)
+            accepted_segment = ScheduledRequestSegment(
+                req_id=req_id,
+                flat_start=0,
+                flat_end=accepted_input_count,
+                position_start=segment.position_start,
+                position_end=segment.position_start + accepted_input_count,
+                state=segment.state,
+            )
+            if accepted_input_count:
+                advance = self._advance_completed_chunks(
+                    accepted_segment,
+                    transaction.encoder_final,
+                    transaction.encoder_layers,
+                    incremental_exact=True,
+                )
+                if advance is not None:
+                    hlm_advances.append(advance)
+            replay.append((transaction, accepted_segment, accepted_input_count))
+
+        self._advance_hlm_batches(hlm_advances)
+        for transaction, accepted_segment, accepted_input_count in replay:
+            if accepted_input_count:
+                for buffer, values in zip(
+                    accepted_segment.state.draft_decoder_layers,
+                    transaction.decoder_layers,
+                    strict=True,
+                ):
+                    append_tensor_buffer(
+                        buffer,
+                        values[:accepted_input_count],
+                        minimum_capacity=max(16, accepted_segment.position_end),
+                    )
+                self.request_states.commit(accepted_segment)
+            del self._dflash_transactions[accepted_segment.req_id]
+
+    def ncp_dflash_proposal_context(
+        self,
+        request_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build target features for a newly sampled, unprocessed anchor token."""
+
+        if not self._ncp_dflash_enabled:
+            raise RuntimeError("NCP DFlash proposal context is not enabled")
+        request_id = str(request_id)
+        state = self.request_states.states.get(request_id)
+        if state is None:
+            raise KeyError(f"DFlash request state is missing for {request_id!r}")
+        context_length = int(state.next_token_position)
+        layer_values = []
+        for layer_id, buffer in zip(
+            self._draft_capture_layer_ids,
+            state.draft_decoder_layers,
+            strict=True,
+        ):
+            if context_length == 0:
+                continue
+            values = active_tensor_buffer(buffer)
+            if values is None or int(values.shape[0]) < context_length:
+                raise RuntimeError(
+                    f"missing DFlash decoder history for layer {layer_id}: "
+                    f"need={context_length} have={buffer.length}"
+                )
+            layer_values.append(values[:context_length])
+
+        embedding_weight = self.token_backbone.embedding.word_embeddings.weight[
+            : self.backend_config.vocab_size
+        ]
+        output_weight = self.token_backbone.output_layer.weight[
+            : self.backend_config.vocab_size
+        ]
+        if context_length:
+            context = torch.stack(layer_values, dim=1).unsqueeze(0)
+            anchor_row = context.new_zeros(
+                (1, 1, len(layer_values), context.shape[-1])
+            )
+            context = torch.cat((context, anchor_row), dim=1)
+        else:
+            context = embedding_weight.new_zeros(
+                (
+                    1,
+                    1,
+                    len(self._draft_capture_layer_ids),
+                    self.backend_config.hidden_size,
+                )
+            )
+
+        completed_chunks = context_length // self.backend_config.chunk_size
+        if completed_chunks == 0:
+            hlm_state = embedding_weight.new_zeros(
+                (1, 1, self.backend_config.hidden_size)
+            )
+        else:
+            source_index = completed_chunks - 1
+            concepts = active_tensor_buffer(state.predicted_concepts)
+            if concepts is None or source_index >= int(concepts.shape[0]):
+                raise RuntimeError(
+                    "DFlash is missing its causal HLM source: "
+                    f"source={source_index} concepts={state.predicted_concepts.length}"
+                )
+            hlm_state = concepts[source_index].view(1, 1, -1)
+        return context, hlm_state, embedding_weight, output_weight
+
     def _advance_completed_chunks(
         self,
         segment: ScheduledRequestSegment,
         encoder_hidden: torch.Tensor,
         encoder_raw_layers: Sequence[torch.Tensor],
+        *,
+        incremental_exact: bool = False,
     ) -> _HLMAdvance | None:
         state = segment.state
         chunk_size = self.backend_config.chunk_size
@@ -197,7 +482,7 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
                     encoder_chunks[0],
                     tuple(values[0] for values in layer_chunks),
                 )
-            elif envs.VLLM_BATCH_INVARIANT:
+            elif incremental_exact or envs.VLLM_BATCH_INVARIANT:
                 # Chunked prefill may present the same prompt as one multi-chunk
                 # segment or as several smaller segments depending on unrelated
                 # requests sharing the scheduler budget. Keep the HLM arithmetic
@@ -412,7 +697,10 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
             hlm_advances = []
             for segment in segments:
                 advance = self._advance_completed_chunks(
-                    segment, encoder_hidden, encoder_raw_layers
+                    segment,
+                    encoder_hidden,
+                    encoder_raw_layers,
+                    incremental_exact=(segment.req_id in self._dflash_transactions),
                 )
                 if advance is not None:
                     hlm_advances.append(advance)
@@ -438,6 +726,7 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
             )
         )
         decoder_history[..., 0, :].copy_(hidden_states)
+        draft_layer_outputs: dict[int, torch.Tensor] = {}
         for layer_index, layer in enumerate(self.token_backbone.decoder.layers):
             record_stage(f"decoder.input.{layer_index}", hidden_states)
             raw_output = layer(positions, hidden_states)
@@ -452,6 +741,8 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
                 concept_sources=concept_sources,
                 gate=decoder_gates[layer_index],
             )
+            if layer_index in self._draft_capture_layer_ids:
+                draft_layer_outputs[layer_index] = hidden_states
             record_stage(f"decoder.routed.{layer_index}", hidden_states)
         final_layernorm = self.token_backbone.decoder.final_layernorm
         if final_layernorm is None:
@@ -461,6 +752,30 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
         record_stage("decoder_final", hidden_states)
         if not profile_mode:
             for segment in segments:
+                self._record_dflash_transaction_features(
+                    segment,
+                    encoder_hidden,
+                    encoder_raw_layers,
+                    draft_layer_outputs,
+                )
+                for buffer, layer_id in zip(
+                    segment.state.draft_decoder_layers,
+                    self._draft_capture_layer_ids,
+                    strict=True,
+                ):
+                    if buffer.length != segment.position_start:
+                        raise RuntimeError(
+                            "DFlash decoder history is not aligned with its segment: "
+                            f"layer={layer_id} history={buffer.length} "
+                            f"start={segment.position_start}"
+                        )
+                    append_tensor_buffer(
+                        buffer,
+                        draft_layer_outputs[layer_id][
+                            segment.flat_start : segment.flat_end
+                        ],
+                        minimum_capacity=max(16, segment.position_end),
+                    )
                 self.request_states.commit(segment)
         if stage_trace is not None:
             stage_trace.update(self.highlevel.stage_trace())

@@ -101,6 +101,7 @@ class ConceptRequestState:
     hlm_kv: list[HLMKVState] = field(default_factory=list)
     hlm_raw_layer_states: list[TensorBuffer] = field(default_factory=list)
     predicted_concepts: TensorBuffer = field(default_factory=TensorBuffer)
+    draft_decoder_layers: list[TensorBuffer] = field(default_factory=list)
 
     @classmethod
     def empty(
@@ -109,6 +110,7 @@ class ConceptRequestState:
         *,
         encoder_layers: int,
         hlm_layers: int,
+        draft_layers: int = 0,
     ) -> ConceptRequestState:
         """Allocate empty per-layer containers without allocating tensors."""
 
@@ -117,7 +119,103 @@ class ConceptRequestState:
             pending_encoder_layers=[TensorBuffer() for _ in range(encoder_layers)],
             hlm_kv=[HLMKVState() for _ in range(hlm_layers)],
             hlm_raw_layer_states=[TensorBuffer() for _ in range(hlm_layers)],
+            draft_decoder_layers=[TensorBuffer() for _ in range(draft_layers)],
         )
+
+
+@dataclass(frozen=True)
+class RequestStateSnapshot:
+    """Rollback checkpoint taken before one speculative target pass."""
+
+    next_token_position: int
+    pending_encoder_final: Any | None
+    pending_encoder_layers: tuple[Any | None, ...]
+    hlm_kv_lengths: tuple[int, ...]
+    hlm_raw_layer_lengths: tuple[int, ...]
+    predicted_concepts_length: int
+    draft_decoder_lengths: tuple[int, ...]
+
+
+def snapshot_request_state(state: ConceptRequestState) -> RequestStateSnapshot:
+    """Capture mutable lengths and the at-most-one-chunk pending rows."""
+
+    def clone_active(buffer: TensorBuffer) -> Any | None:
+        values = active_tensor_buffer(buffer)
+        return None if values is None else values.detach().clone()
+
+    return RequestStateSnapshot(
+        next_token_position=int(state.next_token_position),
+        pending_encoder_final=clone_active(state.pending_encoder_final),
+        pending_encoder_layers=tuple(
+            clone_active(buffer) for buffer in state.pending_encoder_layers
+        ),
+        hlm_kv_lengths=tuple(int(item.length) for item in state.hlm_kv),
+        hlm_raw_layer_lengths=tuple(
+            int(buffer.length) for buffer in state.hlm_raw_layer_states
+        ),
+        predicted_concepts_length=int(state.predicted_concepts.length),
+        draft_decoder_lengths=tuple(
+            int(buffer.length) for buffer in state.draft_decoder_layers
+        ),
+    )
+
+
+def restore_request_state(
+    state: ConceptRequestState,
+    snapshot: RequestStateSnapshot,
+) -> None:
+    """Restore a speculative checkpoint before replaying its accepted prefix."""
+
+    def restore_pending(buffer: TensorBuffer, values: Any | None) -> None:
+        clear_tensor_buffer(buffer)
+        if values is not None:
+            append_tensor_buffer(buffer, values)
+
+    restore_pending(state.pending_encoder_final, snapshot.pending_encoder_final)
+    if len(state.pending_encoder_layers) != len(snapshot.pending_encoder_layers):
+        raise RequestStateError("encoder layer count changed during speculation")
+    for buffer, values in zip(
+        state.pending_encoder_layers,
+        snapshot.pending_encoder_layers,
+        strict=True,
+    ):
+        restore_pending(buffer, values)
+
+    if len(state.hlm_kv) != len(snapshot.hlm_kv_lengths):
+        raise RequestStateError("HLM K/V layer count changed during speculation")
+    for kv_state, length in zip(state.hlm_kv, snapshot.hlm_kv_lengths, strict=True):
+        if kv_state.length < length:
+            raise RequestStateError("HLM K/V history is shorter than its checkpoint")
+        kv_state.length = length
+
+    if len(state.hlm_raw_layer_states) != len(snapshot.hlm_raw_layer_lengths):
+        raise RequestStateError("HLM raw layer count changed during speculation")
+    for buffer, length in zip(
+        state.hlm_raw_layer_states,
+        snapshot.hlm_raw_layer_lengths,
+        strict=True,
+    ):
+        if buffer.length < length:
+            raise RequestStateError("HLM raw history is shorter than its checkpoint")
+        buffer.length = length
+
+    if state.predicted_concepts.length < snapshot.predicted_concepts_length:
+        raise RequestStateError("predicted concepts are shorter than their checkpoint")
+    state.predicted_concepts.length = snapshot.predicted_concepts_length
+
+    if len(state.draft_decoder_layers) != len(snapshot.draft_decoder_lengths):
+        raise RequestStateError("draft decoder layer count changed during speculation")
+    for buffer, length in zip(
+        state.draft_decoder_layers,
+        snapshot.draft_decoder_lengths,
+        strict=True,
+    ):
+        if buffer.length < length:
+            raise RequestStateError(
+                "draft decoder history is shorter than its checkpoint"
+            )
+        buffer.length = length
+    state.next_token_position = snapshot.next_token_position
 
 
 @dataclass(frozen=True)
@@ -135,9 +233,24 @@ class ScheduledRequestSegment:
 class ConceptRequestStateStore:
     """Own persistent ConceptLM state for requests admitted by the V2 runner."""
 
-    def __init__(self, *, encoder_layers: int, hlm_layers: int) -> None:
+    def __init__(
+        self,
+        *,
+        encoder_layers: int,
+        hlm_layers: int,
+        speculative_chunk_size: int | None = None,
+        draft_layers: int = 0,
+    ) -> None:
         self.encoder_layers = int(encoder_layers)
         self.hlm_layers = int(hlm_layers)
+        self.speculative_chunk_size = (
+            int(speculative_chunk_size) if speculative_chunk_size is not None else None
+        )
+        self.draft_layers = int(draft_layers)
+        if self.speculative_chunk_size is not None and self.speculative_chunk_size <= 1:
+            raise ValueError("speculative_chunk_size must be greater than one")
+        if self.draft_layers < 0:
+            raise ValueError("draft_layers must be non-negative")
         self._states: dict[str, ConceptRequestState] = {}
 
     @property
@@ -151,6 +264,7 @@ class ConceptRequestStateStore:
             req_id,
             encoder_layers=self.encoder_layers,
             hlm_layers=self.hlm_layers,
+            draft_layers=self.draft_layers,
         )
         self._states[req_id] = state
         return state
@@ -246,6 +360,54 @@ class ConceptRequestStateStore:
             )
             flat_start = flat_end
         return tuple(segments)
+
+    def rollback_speculative_suffix(
+        self,
+        state: ConceptRequestState,
+        position: int,
+    ) -> None:
+        """Discard a rejected suffix that did not advance the chunk-rate HLM."""
+
+        chunk_size = self.speculative_chunk_size
+        if chunk_size is None:
+            raise RequestStateError("speculative rollback is not enabled")
+        old_position = int(state.next_token_position)
+        if not 0 <= position < old_position:
+            raise RequestStateError(
+                f"invalid speculative rollback position: {position} from {old_position}"
+            )
+        if position // chunk_size != old_position // chunk_size:
+            raise RequestStateError(
+                "NCP DFlash suffix rollback crossed an HLM chunk boundary: "
+                f"{old_position} -> {position}"
+            )
+
+        pending_length = position % chunk_size
+        completed_chunks = position // chunk_size
+        pending_buffers = [state.pending_encoder_final, *state.pending_encoder_layers]
+        for buffer in pending_buffers:
+            if buffer.length < pending_length:
+                raise RequestStateError(
+                    "pending encoder state is shorter than rollback target"
+                )
+            buffer.length = pending_length
+        for kv_state in state.hlm_kv:
+            if kv_state.length != completed_chunks:
+                raise RequestStateError(
+                    "HLM K/V length changed inside a draft-only suffix"
+                )
+        for buffer in [*state.hlm_raw_layer_states, state.predicted_concepts]:
+            if buffer.length != completed_chunks:
+                raise RequestStateError(
+                    "HLM state length changed inside a draft-only suffix"
+                )
+        for buffer in state.draft_decoder_layers:
+            if buffer.length < position:
+                raise RequestStateError(
+                    "draft decoder history is shorter than rollback target"
+                )
+            buffer.length = position
+        state.next_token_position = position
 
     @staticmethod
     def commit(segment: ScheduledRequestSegment) -> None:

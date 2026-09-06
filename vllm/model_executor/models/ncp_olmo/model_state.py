@@ -37,6 +37,7 @@ class NCPOlmoModelState(DefaultModelState):
                 "NCP-ArchPreview model is missing its HLM request state store"
             )
         self.request_states = request_states
+        self._last_request_ids: tuple[str, ...] = ()
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         self.request_states.add_request(
@@ -76,12 +77,44 @@ class NCPOlmoModelState(DefaultModelState):
                 "NCP-ArchPreview received a mixed real/dummy V2 batch: "
                 f"{missing_runner_requests!r} are absent from RequestState"
             )
-        model_inputs["request_segments"] = self.request_states.resolve_segments(
-            input_batch
+        request_segments = self.request_states.resolve_segments(input_batch)
+        model_inputs["request_segments"] = request_segments
+        self._last_request_ids = req_ids
+        begin_transactions = getattr(
+            getattr(self, "model", None),
+            "begin_dflash_transactions",
+            None,
         )
+        if begin_transactions is not None:
+            begin_transactions(
+                request_segments,
+                getattr(input_batch, "num_draft_tokens_per_req", None),
+            )
         return model_inputs
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
         model_inputs["request_segments"] = ()
         return model_inputs
+
+    def postprocess_state(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_computed_tokens: torch.Tensor | None = None,
+    ) -> None:
+        del idx_mapping, num_computed_tokens
+        finalize = getattr(
+            getattr(self, "model", None),
+            "finalize_dflash_transactions",
+            None,
+        )
+        if finalize is not None:
+            finalize(
+                self._last_request_ids,
+                num_sampled,
+                force_full=bool(self._last_request_ids)
+                and all(
+                    req_id.startswith("_warmup_") for req_id in self._last_request_ids
+                ),
+            )

@@ -36,13 +36,19 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        self.trim_invalid_suffix: bool = False
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        *,
+        trim_invalid_suffix: bool = False,
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
+        self.trim_invalid_suffix = trim_invalid_suffix
+        if not input_batch.has_structured_output_reqs and not trim_invalid_suffix:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None
@@ -64,6 +70,19 @@ class DraftTokensHandler:
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
+            if self.trim_invalid_suffix:
+                trimmed = []
+                for row in draft_token_ids:
+                    try:
+                        end = row.index(-1)
+                    except ValueError:
+                        end = len(row)
+                    if any(token_id != -1 for token_id in row[end:]):
+                        raise RuntimeError(
+                            "draft token row contains a non-suffix invalid token"
+                        )
+                    trimmed.append(row[:end])
+                draft_token_ids = trimmed
         else:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]

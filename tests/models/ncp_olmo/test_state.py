@@ -13,8 +13,13 @@ import vllm.envs as envs
 from vllm.model_executor.models.ncp_olmo.model import NCPOlmo3ForCausalLM
 from vllm.model_executor.models.ncp_olmo.model_state import NCPOlmoModelState
 from vllm.model_executor.models.ncp_olmo.state import (
+    ConceptRequestState,
     ConceptRequestStateStore,
     RequestStateError,
+    ScheduledRequestSegment,
+    append_tensor_buffer,
+    restore_request_state,
+    snapshot_request_state,
 )
 
 
@@ -270,6 +275,160 @@ def test_segment_total_must_match_v2_input_batch() -> None:
 
     with pytest.raises(RequestStateError, match="does not match total"):
         store.resolve_segments(input_batch)
+
+
+def test_speculative_snapshot_restores_hlm_and_decoder_lengths() -> None:
+    state = ConceptRequestState.empty(
+        "draft",
+        encoder_layers=2,
+        hlm_layers=2,
+        draft_layers=2,
+    )
+    append_tensor_buffer(state.pending_encoder_final, torch.randn(2, 4))
+    for buffer in state.pending_encoder_layers:
+        append_tensor_buffer(buffer, torch.randn(2, 4))
+    for kv_state in state.hlm_kv:
+        kv_state.key = torch.randn(4, 2)
+        kv_state.value = torch.randn(4, 2)
+        kv_state.length = 2
+    for buffer in state.hlm_raw_layer_states:
+        append_tensor_buffer(buffer, torch.randn(2, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(2, 4))
+    for buffer in state.draft_decoder_layers:
+        append_tensor_buffer(buffer, torch.randn(10, 4))
+    state.next_token_position = 10
+    snapshot = snapshot_request_state(state)
+
+    append_tensor_buffer(state.pending_encoder_final, torch.randn(1, 4))
+    for buffer in state.pending_encoder_layers:
+        append_tensor_buffer(buffer, torch.randn(1, 4))
+    for kv_state in state.hlm_kv:
+        kv_state.length = 3
+    for buffer in state.hlm_raw_layer_states:
+        append_tensor_buffer(buffer, torch.randn(1, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(1, 4))
+    for buffer in state.draft_decoder_layers:
+        append_tensor_buffer(buffer, torch.randn(2, 4))
+    state.next_token_position = 12
+
+    restore_request_state(state, snapshot)
+
+    assert state.next_token_position == 10
+    assert state.pending_encoder_final.length == 2
+    assert [item.length for item in state.hlm_kv] == [2, 2]
+    assert state.predicted_concepts.length == 2
+    assert [buffer.length for buffer in state.draft_decoder_layers] == [10, 10]
+
+
+def test_same_chunk_speculative_rollback_truncates_only_suffix() -> None:
+    store = ConceptRequestStateStore(
+        encoder_layers=1,
+        hlm_layers=1,
+        speculative_chunk_size=4,
+        draft_layers=1,
+    )
+    store.add_request("draft", computed_tokens=0)
+    state = store.states["draft"]
+    append_tensor_buffer(state.pending_encoder_final, torch.randn(3, 4))
+    append_tensor_buffer(state.pending_encoder_layers[0], torch.randn(3, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(7, 4))
+    state.hlm_kv[0].length = 1
+    append_tensor_buffer(state.hlm_raw_layer_states[0], torch.randn(1, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(1, 4))
+    state.next_token_position = 7
+
+    store.rollback_speculative_suffix(state, 6)
+
+    assert state.next_token_position == 6
+    assert state.pending_encoder_final.length == 2
+    assert state.pending_encoder_layers[0].length == 2
+    assert state.hlm_kv[0].length == 1
+    assert state.predicted_concepts.length == 1
+    assert state.draft_decoder_layers[0].length == 6
+
+
+def test_target_transaction_uses_rejection_sampler_accepted_count() -> None:
+    model = object.__new__(NCPOlmo3ForCausalLM)
+    model._ncp_dflash_enabled = True
+    model.backend_config = SimpleNamespace(chunk_size=4)
+    model.request_states = ConceptRequestStateStore(
+        encoder_layers=1,
+        hlm_layers=1,
+        speculative_chunk_size=4,
+        draft_layers=1,
+    )
+    model._dflash_transactions = {}
+    model.request_states.add_request("draft", computed_tokens=0)
+    state = model.request_states.states["draft"]
+    state.next_token_position = 4
+    state.hlm_kv[0].length = 1
+    append_tensor_buffer(state.hlm_raw_layer_states[0], torch.randn(1, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(1, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(4, 4))
+    segment = ScheduledRequestSegment(
+        req_id="draft",
+        flat_start=0,
+        flat_end=3,
+        position_start=4,
+        position_end=7,
+        state=state,
+    )
+    model.begin_dflash_transactions((segment,), (2,))
+    append_tensor_buffer(state.pending_encoder_final, torch.randn(3, 4))
+    append_tensor_buffer(state.pending_encoder_layers[0], torch.randn(3, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(3, 4))
+    state.next_token_position = 7
+
+    model.finalize_dflash_transactions(("draft",), torch.tensor([1]))
+
+    assert state.next_token_position == 5
+    assert state.pending_encoder_final.length == 1
+    assert state.draft_decoder_layers[0].length == 5
+    assert not model._dflash_transactions
+
+
+def test_target_transaction_forces_full_commit_for_kernel_warmup() -> None:
+    model = object.__new__(NCPOlmo3ForCausalLM)
+    model._ncp_dflash_enabled = True
+    model.backend_config = SimpleNamespace(chunk_size=4)
+    model.request_states = ConceptRequestStateStore(
+        encoder_layers=1,
+        hlm_layers=1,
+        speculative_chunk_size=4,
+        draft_layers=1,
+    )
+    model._dflash_transactions = {}
+    model.request_states.add_request("_warmup_0_", computed_tokens=0)
+    state = model.request_states.states["_warmup_0_"]
+    state.next_token_position = 4
+    state.hlm_kv[0].length = 1
+    append_tensor_buffer(state.hlm_raw_layer_states[0], torch.randn(1, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(1, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(4, 4))
+    segment = ScheduledRequestSegment(
+        req_id="_warmup_0_",
+        flat_start=0,
+        flat_end=3,
+        position_start=4,
+        position_end=7,
+        state=state,
+    )
+    model.begin_dflash_transactions((segment,), (2,))
+    append_tensor_buffer(state.pending_encoder_final, torch.randn(3, 4))
+    append_tensor_buffer(state.pending_encoder_layers[0], torch.randn(3, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(3, 4))
+    state.next_token_position = 7
+
+    model.finalize_dflash_transactions(
+        ("_warmup_0_",),
+        torch.tensor([1]),
+        force_full=True,
+    )
+
+    assert state.next_token_position == 7
+    assert state.pending_encoder_final.length == 3
+    assert state.draft_decoder_layers[0].length == 7
+    assert not model._dflash_transactions
 
 
 def make_model_state() -> NCPOlmoModelState:

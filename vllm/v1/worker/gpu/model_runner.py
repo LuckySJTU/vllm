@@ -286,7 +286,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "dflash",
                 "dspark",
                 "extract_hidden_states",
-            ):
+            ) and getattr(self.speculator, "requires_aux_hidden_states", True):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
 
@@ -2151,6 +2151,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                trim_invalid_suffix=self.speculator.variable_draft_lengths,
             )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(

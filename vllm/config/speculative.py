@@ -1292,6 +1292,12 @@ class SpeculativeConfig:
                     config_format=self.target_model_config.config_format,
                 )
 
+                if (
+                    self.draft_model_config.hf_config.model_type
+                    == "conceptlm_dflash"
+                ):
+                    self.disable_padded_drafter_batch = True
+
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # omit vocab_size in config.json, so MedusaConfig falls back to
                 # its default (32001). Align with the target model's vocab size
