@@ -7,6 +7,13 @@ import argparse
 import os
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def build_attention_config(mode: str) -> dict[str, object] | None:
     if mode == "auto":
         return None
@@ -53,6 +60,45 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dflash-attention-backend",
+        choices=("sdpa", "flash_varlen", "flex_attention"),
+        default="sdpa",
+        help=(
+            "Draft attention backend. SDPA is the correctness-first default; "
+            "FlashAttention varlen is an explicit performance opt-in."
+        ),
+    )
+    parser.add_argument(
+        "--dflash-context-kv-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cache request-local draft context projections.",
+    )
+    parser.add_argument(
+        "--dflash-sparse-context-projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Project only uncached request-local context suffixes.",
+    )
+    parser.add_argument(
+        "--dflash-min-eligible-batch",
+        type=positive_int,
+        default=1,
+        help="Skip DFlash unless at least this many decode rows are eligible.",
+    )
+    parser.add_argument(
+        "--dflash-min-proposal-tokens-per-row",
+        type=positive_int,
+        default=1,
+        help="Skip DFlash for rows whose draft width is below this value.",
+    )
+    parser.add_argument(
+        "--dflash-min-proposal-tokens-per-batch",
+        type=positive_int,
+        default=1,
+        help="Skip DFlash unless the eligible rows propose this many tokens.",
+    )
+    parser.add_argument(
         "--attention-mode",
         choices=("auto", "flash-attn", "mixed-flashinfer"),
         default="auto",
@@ -69,18 +115,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def configure_dflash_env(args: argparse.Namespace) -> None:
+    if not args.draft_model:
+        return
+    if (
+        args.dflash_attention_backend == "flash_varlen"
+        and not args.dflash_context_kv_cache
+    ):
+        raise ValueError("flash_varlen requires the DFlash context KV cache")
+
+    settings = {
+        "NCP_OLMO_DFLASH_VERIFICATION_MODE": args.dflash_verification_mode,
+        "NCP_OLMO_DFLASH_ATTENTION_BACKEND": args.dflash_attention_backend,
+        "NCP_OLMO_DFLASH_CONTEXT_KV_CACHE": str(int(args.dflash_context_kv_cache)),
+        "NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION": str(
+            int(args.dflash_sparse_context_projection)
+        ),
+        "NCP_OLMO_DFLASH_MIN_ELIGIBLE_BATCH": str(args.dflash_min_eligible_batch),
+        "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW": str(
+            args.dflash_min_proposal_tokens_per_row
+        ),
+        "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH": str(
+            args.dflash_min_proposal_tokens_per_batch
+        ),
+    }
+    if args.dflash_active_batch_widths:
+        settings["NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS"] = (
+            args.dflash_active_batch_widths
+        )
+    os.environ.update(settings)
+
+
 def main() -> None:
     args = parse_args()
     if args.flashinfer_sampler:
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
-    if args.draft_model:
-        os.environ["NCP_OLMO_DFLASH_VERIFICATION_MODE"] = (
-            args.dflash_verification_mode
-        )
-        if args.dflash_active_batch_widths:
-            os.environ["NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS"] = (
-                args.dflash_active_batch_widths
-            )
+    configure_dflash_env(args)
 
     from vllm import LLM, SamplingParams
 

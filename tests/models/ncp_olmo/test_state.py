@@ -387,6 +387,62 @@ def test_target_transaction_uses_rejection_sampler_accepted_count() -> None:
     assert not model._dflash_transactions
 
 
+def test_cross_chunk_transaction_replays_only_accepted_prefix() -> None:
+    model = object.__new__(NCPOlmo3ForCausalLM)
+    model._ncp_dflash_enabled = True
+    model.backend_config = SimpleNamespace(chunk_size=4)
+    model.request_states = ConceptRequestStateStore(
+        encoder_layers=1,
+        hlm_layers=1,
+        speculative_chunk_size=4,
+        draft_layers=1,
+    )
+    model._draft_capture_layer_ids = (0,)
+    model._dflash_transactions = {}
+    model.request_states.add_request("draft", computed_tokens=0)
+    state = model.request_states.states["draft"]
+    state.next_token_position = 6
+    append_tensor_buffer(state.pending_encoder_final, torch.randn(2, 4))
+    append_tensor_buffer(state.pending_encoder_layers[0], torch.randn(2, 4))
+    state.hlm_kv[0].length = 1
+    append_tensor_buffer(state.hlm_raw_layer_states[0], torch.randn(1, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(1, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(6, 4))
+    segment = ScheduledRequestSegment(
+        req_id="draft",
+        flat_start=0,
+        flat_end=4,
+        position_start=6,
+        position_end=10,
+        state=state,
+    )
+    model.begin_dflash_transactions((segment,), (3,))
+    transaction = model._dflash_transactions["draft"]
+    assert transaction.snapshot is not None
+    transaction.encoder_final = torch.randn(4, 4)
+    transaction.encoder_layers = (torch.randn(4, 4),)
+    transaction.decoder_layers = (torch.randn(4, 4),)
+
+    state.next_token_position = 10
+    state.pending_encoder_final.length = 2
+    state.pending_encoder_layers[0].length = 2
+    state.hlm_kv[0].length = 2
+    append_tensor_buffer(state.hlm_raw_layer_states[0], torch.randn(1, 4))
+    append_tensor_buffer(state.predicted_concepts, torch.randn(1, 4))
+    append_tensor_buffer(state.draft_decoder_layers[0], torch.randn(4, 4))
+
+    model.finalize_dflash_transactions(("draft",), torch.tensor([1]))
+
+    assert state.next_token_position == 7
+    assert state.pending_encoder_final.length == 3
+    assert state.pending_encoder_layers[0].length == 3
+    assert state.hlm_kv[0].length == 1
+    assert state.hlm_raw_layer_states[0].length == 1
+    assert state.predicted_concepts.length == 1
+    assert state.draft_decoder_layers[0].length == 7
+    assert not model._dflash_transactions
+
+
 def test_target_transaction_forces_full_commit_for_kernel_warmup() -> None:
     model = object.__new__(NCPOlmo3ForCausalLM)
     model._ncp_dflash_enabled = True
