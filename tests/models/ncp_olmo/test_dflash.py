@@ -3,7 +3,8 @@
 
 """Contract tests for NCP-OLMo's matching DFlash checkpoint."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,7 +20,9 @@ from vllm.v1.worker.gpu.spec_decode.ncp_dflash import (
     NCPDFlashSpeculator,
     _dflash_context_kv,
     _dflash_sdpa_mask,
+    _flash_varlen_dflash_attention,
     _parse_active_batch_widths,
+    _sdpa_dflash_attention,
 )
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
@@ -34,9 +37,7 @@ class _CountingProjection(torch.nn.Linear):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         self.call_count += 1
-        self.projected_tokens += int(
-            hidden_states.numel() // hidden_states.shape[-1]
-        )
+        self.projected_tokens += int(hidden_states.numel() // hidden_states.shape[-1])
         return super().forward(hidden_states)
 
 
@@ -166,6 +167,38 @@ def test_active_batch_policy_caps_safe_proposal_window() -> None:
     assert speculator.safe_proposal_count(64, proposal_cap=4) == 0
 
 
+def test_minimum_row_width_skips_low_value_proposals() -> None:
+    speculator = object.__new__(NCPDFlashSpeculator)
+    speculator.num_speculative_steps = 8
+    speculator.max_model_len = 64
+    speculator.chunk_size = 4
+    speculator.verification_mode = "intra_chunk_exact"
+    speculator.min_proposal_tokens_per_row = 2
+
+    assert [speculator.safe_proposal_count(length) for length in range(1, 5)] == [
+        2,
+        0,
+        0,
+        0,
+    ]
+
+
+def test_batch_gate_skips_only_low_value_multi_request_steps() -> None:
+    speculator = object.__new__(NCPDFlashSpeculator)
+    speculator.max_num_reqs = 8
+    speculator.min_eligible_batch = 2
+    speculator.min_proposal_tokens_per_batch = 4
+
+    assert speculator._proposal_batch_skip_reason([2]) == ("eligible_batch_too_small")
+    assert speculator._proposal_batch_skip_reason([1, 1]) == (
+        "proposal_budget_too_small"
+    )
+    assert speculator._proposal_batch_skip_reason([2, 2]) is None
+
+    speculator.max_num_reqs = 1
+    assert speculator._proposal_batch_skip_reason([2]) == ("proposal_budget_too_small")
+
+
 @pytest.mark.parametrize(
     ("policy", "message"),
     [
@@ -197,6 +230,84 @@ def test_sdpa_mask_matches_dflash_context_and_block_visibility() -> None:
     ]
 
 
+def test_flash_varlen_packs_request_local_context_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(42)
+    layer = _context_kv_test_layer()
+    layer.q_proj = _CountingProjection(4)
+    layer.q_norm = torch.nn.Identity()
+    layer._ncp_dflash_request_ids = ["request-a", "request-b"]
+    layer._ncp_dflash_causal_lengths = [2, 3]
+    slots = torch.randn(2, 1, 4, 4)
+    context = torch.randn(2, 3, 4)
+    anchor_positions = torch.tensor([[2], [3]])
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_flash_attn_varlen_func(**kwargs: object) -> torch.Tensor:
+        query = kwargs["q"]
+        key = kwargs["k"]
+        value = kwargs["v"]
+        cu_seqlens_q = kwargs["cu_seqlens_q"]
+        cu_seqlens_k = kwargs["cu_seqlens_k"]
+        assert all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (query, key, value, cu_seqlens_q, cu_seqlens_k)
+        )
+        captured["query"] = query
+        captured["key"] = key
+        captured["value"] = value
+        outputs = []
+        for row_index in range(int(cu_seqlens_q.numel()) - 1):
+            query_start = int(cu_seqlens_q[row_index])
+            query_end = int(cu_seqlens_q[row_index + 1])
+            key_start = int(cu_seqlens_k[row_index])
+            key_end = int(cu_seqlens_k[row_index + 1])
+            row_query = query[query_start:query_end].transpose(0, 1)
+            row_key = key[key_start:key_end].transpose(0, 1)
+            row_value = value[key_start:key_end].transpose(0, 1)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                row_query.unsqueeze(0),
+                row_key.unsqueeze(0),
+                row_value.unsqueeze(0),
+                dropout_p=0.0,
+                scale=kwargs["softmax_scale"],
+            )
+            outputs.append(output.squeeze(0).transpose(0, 1))
+        return torch.cat(outputs, dim=0)
+
+    flash_module = ModuleType("vllm.vllm_flash_attn")
+    flash_module.flash_attn_varlen_func = fake_flash_attn_varlen_func
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", flash_module)
+
+    actual = _flash_varlen_dflash_attention(
+        layer,
+        slots,
+        context,
+        anchor_positions,
+        None,
+    )
+
+    assert actual.shape == (2, 1, 4, 4)
+    assert captured["query"].shape == (8, 2, 2)
+    assert captured["key"].shape == (13, 2, 2)
+    assert captured["value"].shape == (13, 2, 2)
+
+    reference = _context_kv_test_layer()
+    reference.q_proj = _CountingProjection(4)
+    reference.q_norm = torch.nn.Identity()
+    reference._ncp_dflash_request_ids = ["request-a", "request-b"]
+    reference._ncp_dflash_causal_lengths = [2, 3]
+    expected = _sdpa_dflash_attention(
+        reference,
+        slots,
+        context,
+        anchor_positions,
+        None,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_context_kv_cache_survives_continuous_batch_row_reorder() -> None:
     layer = _context_kv_test_layer()
     layer._ncp_dflash_request_ids = ["request-a", "request-b"]
@@ -212,9 +323,7 @@ def test_context_kv_cache_survives_continuous_batch_row_reorder() -> None:
 
     second = torch.zeros(2, 5, 4)
     second[0, :3] = torch.tensor([[10.0] * 4, [11.0] * 4, [12.0] * 4])
-    second[1, :4] = torch.tensor(
-        [[1.0] * 4, [2.0] * 4, [3.0] * 4, [4.0] * 4]
-    )
+    second[1, :4] = torch.tensor([[1.0] * 4, [2.0] * 4, [3.0] * 4, [4.0] * 4])
     layer._ncp_dflash_request_ids = ["request-b", "request-a"]
     layer._ncp_dflash_causal_lengths = [3, 4]
     cached_key, cached_value = _dflash_context_kv(
@@ -226,6 +335,8 @@ def test_context_kv_cache_survives_continuous_batch_row_reorder() -> None:
     assert layer.k_proj.projected_tokens == 7
     assert layer.v_proj.projected_tokens == 7
     assert layer.k_proj.call_count == 2
+    assert layer._ncp_dflash_context_kv_projected_tokens == 7
+    assert layer._ncp_dflash_context_kv_reused_tokens == 5
     reference = _context_kv_test_layer()
     expected_key, expected_value = _dflash_context_kv(
         reference,

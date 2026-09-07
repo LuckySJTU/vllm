@@ -65,6 +65,23 @@ def _parse_active_batch_widths(
     return tuple(sorted(buckets.items()))
 
 
+def _read_positive_env_int(
+    name: str,
+    *,
+    default: int,
+    legacy_name: str | None = None,
+) -> int:
+    """Read a positive integer while accepting the internal legacy name."""
+
+    raw_value = os.environ.get(name)
+    if raw_value is None and legacy_name is not None:
+        raw_value = os.environ.get(legacy_name)
+    value = default if raw_value is None else int(raw_value)
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1")
+    return value
+
+
 def _dflash_sdpa_mask(
     anchor_positions: torch.Tensor,
     *,
@@ -89,8 +106,7 @@ def _dflash_sdpa_mask(
         torch.arange(query_length, device=anchor_positions.device) // block_size
     )
     draft_allowed = (
-        query_blocks.view(1, query_length, 1)
-        == draft_blocks.view(1, 1, query_length)
+        query_blocks.view(1, query_length, 1) == draft_blocks.view(1, 1, query_length)
     ) & valid_queries.unsqueeze(-1)
     return torch.cat((context_allowed, draft_allowed), dim=-1).view(
         batch_size,
@@ -136,6 +152,8 @@ def _dflash_cached_context_kv_rows(
     suffixes: list[torch.Tensor] = []
     suffix_positions: list[torch.Tensor] = []
     suffix_lengths: list[int] = []
+    projected_tokens = 0
+    reused_tokens = 0
 
     for row_index, raw_request_id in enumerate(request_ids):
         request_id = str(raw_request_id)
@@ -196,6 +214,8 @@ def _dflash_cached_context_kv_rows(
                 )
             )
             suffix_lengths.append(suffix_length)
+            projected_tokens += suffix_length
+        reused_tokens += min(int(cached_length), causal_length)
         records.append(
             (
                 request_id,
@@ -264,6 +284,13 @@ def _dflash_cached_context_kv_rows(
         values.append(cached_value[:, :, :causal_length])
     if projected_index != len(projected_keys):
         raise RuntimeError("NCP DFlash context KV suffix accounting drifted")
+    layer._ncp_dflash_context_kv_projected_tokens = (
+        int(getattr(layer, "_ncp_dflash_context_kv_projected_tokens", 0))
+        + projected_tokens
+    )
+    layer._ncp_dflash_context_kv_reused_tokens = (
+        int(getattr(layer, "_ncp_dflash_context_kv_reused_tokens", 0)) + reused_tokens
+    )
     return keys, values
 
 
@@ -384,11 +411,114 @@ def _sdpa_dflash_attention(
     )
 
 
+def _flash_varlen_dflash_attention(
+    layer: torch.nn.Module,
+    slots: torch.Tensor,
+    context: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    block_mask: Any,
+) -> torch.Tensor:
+    """Run packed FlashAttention for one DFlash anchor per request."""
+
+    del block_mask
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    batch_size, anchor_count, block_size, hidden_size = slots.shape
+    if anchor_count != 1:
+        raise ValueError("packed NCP DFlash attention requires one anchor per request")
+    slot_positions = anchor_positions.clamp(min=0).unsqueeze(-1) + torch.arange(
+        block_size,
+        device=slots.device,
+    )
+    query = layer._split_heads(layer.q_norm(layer.q_proj(slots)))
+    slot_key = layer._split_heads(layer.k_norm(layer.k_proj(slots)))
+    slot_value = layer._split_heads(layer.v_proj(slots))
+    query = layer.rotary(query, slot_positions)
+    slot_key = layer.rotary(slot_key, slot_positions)
+
+    context_keys, context_values = _dflash_cached_context_kv_rows(
+        layer,
+        context,
+        anchor_positions,
+    )
+    query_length = anchor_count * block_size
+    query = query.reshape(
+        batch_size * query_length,
+        layer.num_attention_heads,
+        layer.head_size,
+    ).contiguous()
+    slot_key = slot_key.reshape(
+        batch_size,
+        query_length,
+        layer.num_attention_heads,
+        layer.head_size,
+    )
+    slot_value = slot_value.reshape(
+        batch_size,
+        query_length,
+        layer.num_attention_heads,
+        layer.head_size,
+    )
+    key_rows = [
+        torch.cat(
+            (
+                context_key.squeeze(0).transpose(0, 1).to(query.dtype),
+                slot_key[row_index].to(query.dtype),
+            ),
+            dim=0,
+        )
+        for row_index, context_key in enumerate(context_keys)
+    ]
+    value_rows = [
+        torch.cat(
+            (
+                context_value.squeeze(0).transpose(0, 1).to(query.dtype),
+                slot_value[row_index].to(query.dtype),
+            ),
+            dim=0,
+        )
+        for row_index, context_value in enumerate(context_values)
+    ]
+    key_lengths = [int(key.shape[0]) for key in key_rows]
+    cu_seqlens_q = torch.arange(
+        0,
+        (batch_size + 1) * query_length,
+        query_length,
+        device=slots.device,
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *key_lengths],
+        device=slots.device,
+        dtype=torch.int32,
+    ).cumsum(dim=0, dtype=torch.int32)
+    attended = flash_attn_varlen_func(
+        q=query,
+        k=torch.cat(key_rows, dim=0),
+        v=torch.cat(value_rows, dim=0),
+        max_seqlen_q=query_length,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_k=max(key_lengths),
+        cu_seqlens_k=cu_seqlens_k,
+        dropout_p=0.0,
+        softmax_scale=layer.head_size**-0.5,
+        causal=False,
+        fa_version=3,
+    )
+    return attended.reshape(
+        batch_size,
+        anchor_count,
+        block_size,
+        hidden_size,
+    )
+
+
 def _install_draft_attention_backend(model: torch.nn.Module) -> str:
     backend = os.environ.get("NCP_OLMO_DFLASH_ATTENTION_BACKEND", "sdpa")
-    if backend not in {"sdpa", "flex_attention"}:
+    if backend not in {"flash_varlen", "sdpa", "flex_attention"}:
         raise ValueError(
-            "NCP_OLMO_DFLASH_ATTENTION_BACKEND must be sdpa or flex_attention"
+            "NCP_OLMO_DFLASH_ATTENTION_BACKEND must be flash_varlen, sdpa, "
+            "or flex_attention"
         )
     model.config.flex_attention_compile = False
     if backend == "flex_attention":
@@ -408,7 +538,12 @@ def _install_draft_attention_backend(model: torch.nn.Module) -> str:
     forward_globals["_create_dflash_block_mask"] = lambda *_args, **_kwargs: None
     for layer in model.layers:
         layer.flex_attention_compile = False
-        layer._attention = MethodType(_sdpa_dflash_attention, layer)
+        attention = (
+            _flash_varlen_dflash_attention
+            if backend == "flash_varlen"
+            else _sdpa_dflash_attention
+        )
+        layer._attention = MethodType(attention, layer)
     return backend
 
 
@@ -460,13 +595,27 @@ class NCPDFlashSpeculator(BaseSpeculator):
             os.environ.get("NCP_OLMO_DFLASH_CONTEXT_KV_CACHE", "1") == "1"
         )
         self.sparse_context_projection = (
-            os.environ.get("NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION", "1")
-            == "1"
+            os.environ.get("NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION", "1") == "1"
         )
         if self.sparse_context_projection and not self.context_kv_cache:
             raise ValueError(
                 "NCP DFlash sparse context projection requires context KV cache"
             )
+        self.min_eligible_batch = _read_positive_env_int(
+            "NCP_OLMO_DFLASH_MIN_ELIGIBLE_BATCH",
+            default=1,
+            legacy_name="CONCEPTLM_DFLASH_MIN_ELIGIBLE_BATCH",
+        )
+        self.min_proposal_tokens_per_row = _read_positive_env_int(
+            "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW",
+            default=1,
+            legacy_name="CONCEPTLM_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW",
+        )
+        self.min_proposal_tokens_per_batch = _read_positive_env_int(
+            "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH",
+            default=1,
+            legacy_name="CONCEPTLM_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH",
+        )
         self.chunk_size = int(self.draft_config.concept_chunk_size)
         self.draft_tokens = torch.full(
             (self.max_num_reqs, self.num_speculative_steps),
@@ -480,15 +629,25 @@ class NCPDFlashSpeculator(BaseSpeculator):
         self.draft_logits: torch.Tensor | None = None
         self._draft_model: torch.nn.Module | None = None
         self._logged_first_proposal = False
+        self._last_context_kv_cache_stats: dict[str, Any] = {
+            "enabled": self.context_kv_cache,
+            "projected_tokens": 0,
+            "reused_tokens": 0,
+        }
+        self._last_proposal_stats: dict[str, Any] = {}
         logger.info(
             "NCP DFlash enabled with verification_mode=%s, proposal_width=%d, "
             "active_batch_widths=%s, context_kv_cache=%s, and "
-            "sparse_context_projection=%s",
+            "sparse_context_projection=%s, min_eligible_batch=%d, "
+            "min_tokens_per_row=%d, and min_tokens_per_batch=%d",
             self.verification_mode,
             self.num_speculative_steps,
             self.active_batch_widths or "static",
             self.context_kv_cache,
             self.sparse_context_projection,
+            self.min_eligible_batch,
+            self.min_proposal_tokens_per_row,
+            self.min_proposal_tokens_per_batch,
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -535,6 +694,11 @@ class NCPDFlashSpeculator(BaseSpeculator):
         if str(model.config.hlm_conditioning) != "causal_residual":
             raise ValueError("loaded NCP drafter must use causal_residual HLM state")
         attention_backend = _install_draft_attention_backend(model)
+        if attention_backend == "flash_varlen" and not self.context_kv_cache:
+            raise ValueError(
+                "flash_varlen NCP DFlash attention requires request-local "
+                "context KV cache"
+            )
         logger.info("NCP DFlash draft attention backend: %s", attention_backend)
         self._draft_model = model
         return model
@@ -569,14 +733,35 @@ class NCPDFlashSpeculator(BaseSpeculator):
                 self.max_model_len - int(prefix_length),
             ),
         )
-        if self.verification_mode == "segmented_kv_approx":
-            return maximum
-        anchor_position = int(prefix_length) - 1
-        before_chunk = self.chunk_size - 2 - (anchor_position % self.chunk_size)
-        maximum = min(maximum, max(0, before_chunk))
-        if self.verification_mode == "sequential_exact":
-            maximum = min(maximum, 1)
+        if self.verification_mode != "segmented_kv_approx":
+            anchor_position = int(prefix_length) - 1
+            before_chunk = self.chunk_size - 2 - (anchor_position % self.chunk_size)
+            maximum = min(maximum, max(0, before_chunk))
+            if self.verification_mode == "sequential_exact":
+                maximum = min(maximum, 1)
+        if maximum < getattr(self, "min_proposal_tokens_per_row", 1):
+            return 0
         return maximum
+
+    def _proposal_batch_skip_reason(
+        self,
+        proposal_counts: list[int],
+    ) -> str | None:
+        """Return why this draft batch is too small to amortize safely."""
+
+        if not proposal_counts:
+            return "no_eligible_rows"
+        if self.max_num_reqs > 1 and len(proposal_counts) < getattr(
+            self, "min_eligible_batch", 1
+        ):
+            return "eligible_batch_too_small"
+        if sum(proposal_counts) < getattr(
+            self,
+            "min_proposal_tokens_per_batch",
+            1,
+        ):
+            return "proposal_budget_too_small"
+        return None
 
     @staticmethod
     def _pad_context_batch(contexts: list[torch.Tensor]) -> torch.Tensor:
@@ -653,9 +838,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
             suffix_starts.append(suffix_start)
             suffix_lengths.append(suffix_length)
             if suffix_length:
-                suffixes.append(
-                    contexts[row_index][0, suffix_start:causal_length]
-                )
+                suffixes.append(contexts[row_index][0, suffix_start:causal_length])
 
         hidden_size = int(draft.config.draft_hidden_size)
         if suffixes:
@@ -673,8 +856,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
             ]
         else:
             layer_suffixes = [
-                anchor_embeddings.new_empty((0, hidden_size))
-                for _ in draft.layers
+                anchor_embeddings.new_empty((0, hidden_size)) for _ in draft.layers
             ]
 
         compact_length = max(suffix_lengths, default=0)
@@ -725,6 +907,13 @@ class NCPDFlashSpeculator(BaseSpeculator):
                 None,
             )
         hidden = draft.output_projection(draft.final_norm(slots))
+        self._last_sparse_context_projection = {
+            "enabled": True,
+            "projected_target_tokens": sum(suffix_lengths),
+            "total_causal_target_tokens": sum(
+                prefix_length - 1 for prefix_length in prefix_lengths
+            ),
+        }
         return SimpleNamespace(last_hidden_state=hidden)
 
     def _prune_context_kv_cache(self, request_ids: list[str]) -> None:
@@ -877,6 +1066,30 @@ class NCPDFlashSpeculator(BaseSpeculator):
             and self.dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+        cache_counters_before = [
+            (
+                int(
+                    getattr(
+                        layer,
+                        "_ncp_dflash_context_kv_projected_tokens",
+                        0,
+                    )
+                ),
+                int(
+                    getattr(
+                        layer,
+                        "_ncp_dflash_context_kv_reused_tokens",
+                        0,
+                    )
+                ),
+            )
+            for layer in draft.layers
+        ]
+        self._last_sparse_context_projection = {
+            "enabled": False,
+            "projected_target_tokens": 0,
+            "total_causal_target_tokens": 0,
+        }
         for layer in draft.layers:
             if self.context_kv_cache:
                 layer._ncp_dflash_request_ids = request_ids
@@ -916,7 +1129,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
                     ):
                         if hasattr(layer, attribute):
                             delattr(layer, attribute)
-            return self._path_selector_batch(
+            selected = self._path_selector_batch(
                 draft,
                 output.last_hidden_state[:, 0],
                 output_weight,
@@ -924,6 +1137,42 @@ class NCPDFlashSpeculator(BaseSpeculator):
                 anchor_ids,
                 proposal_counts,
             )
+        projected_tokens = 0
+        reused_tokens = 0
+        for layer, (projected_before, reused_before) in zip(
+            draft.layers,
+            cache_counters_before,
+            strict=True,
+        ):
+            projected_tokens += (
+                int(
+                    getattr(
+                        layer,
+                        "_ncp_dflash_context_kv_projected_tokens",
+                        0,
+                    )
+                )
+                - projected_before
+            )
+            reused_tokens += (
+                int(
+                    getattr(
+                        layer,
+                        "_ncp_dflash_context_kv_reused_tokens",
+                        0,
+                    )
+                )
+                - reused_before
+            )
+        self._last_context_kv_cache_stats = {
+            "enabled": self.context_kv_cache,
+            "projected_tokens": projected_tokens,
+            "reused_tokens": reused_tokens,
+            "sparse_context_projection": self._last_sparse_context_projection,
+            "proposal_block_size": proposal_block_size,
+            "runtime_block_size": int(draft.config.block_size),
+        }
+        return selected
 
     @torch.inference_mode()
     def propose(
@@ -966,8 +1215,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
         if dummy_run:
             return result
         if input_batch.req_ids and all(
-            str(request_id).startswith("_warmup_")
-            for request_id in input_batch.req_ids
+            str(request_id).startswith("_warmup_") for request_id in input_batch.req_ids
         ):
             # Kernel warmup schedules the configured maximum width directly
             # and does not consume per-row proposal lengths from the scheduler.
@@ -978,6 +1226,11 @@ class NCPDFlashSpeculator(BaseSpeculator):
         self._prune_context_kv_cache(
             [str(request_id) for request_id in input_batch.req_ids]
         )
+        self._last_context_kv_cache_stats = {
+            "enabled": self.context_kv_cache,
+            "projected_tokens": 0,
+            "reused_tokens": 0,
+        }
 
         sampled_counts = num_sampled[:num_reqs].detach().cpu().tolist()
         active_decode_batch_size = sum(
@@ -1018,6 +1271,15 @@ class NCPDFlashSpeculator(BaseSpeculator):
             eligible_anchor_ids.append(anchor_ids[row_index])
             proposal_counts.append(proposal_count)
 
+        eligible_before_gate = len(eligible_rows)
+        requested_proposal_tokens = sum(proposal_counts)
+        skip_reason = self._proposal_batch_skip_reason(proposal_counts)
+        if skip_reason is not None:
+            eligible_rows = []
+            eligible_request_ids = []
+            eligible_anchor_ids = []
+            proposal_counts = []
+
         if eligible_rows:
             selected = self._propose_rows(
                 eligible_request_ids,
@@ -1030,9 +1292,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
                 proposal_counts,
                 strict=True,
             ):
-                result[output_row, :proposal_count].copy_(
-                    selected_row[:proposal_count]
-                )
+                result[output_row, :proposal_count].copy_(selected_row[:proposal_count])
             if not self._logged_first_proposal:
                 logger.info(
                     "NCP DFlash emitted its first proposal batch: requests=%d "
@@ -1041,4 +1301,14 @@ class NCPDFlashSpeculator(BaseSpeculator):
                     sum(proposal_counts),
                 )
                 self._logged_first_proposal = True
+        self._last_proposal_stats = {
+            "active_decode_batch_size": active_decode_batch_size,
+            "active_batch_width": active_batch_width,
+            "eligible_before_gate": eligible_before_gate,
+            "eligible_request_count": len(eligible_rows),
+            "requested_proposal_tokens": requested_proposal_tokens,
+            "emitted_proposal_tokens": sum(proposal_counts),
+            "skip_reason": skip_reason,
+            "context_kv_cache": self._last_context_kv_cache_stats,
+        }
         return result
