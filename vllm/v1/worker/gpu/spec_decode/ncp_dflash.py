@@ -6,9 +6,8 @@
 from __future__ import annotations
 
 import math
-import os
 from contextlib import nullcontext
-from types import MethodType, SimpleNamespace
+from types import FunctionType, MethodType, SimpleNamespace
 from typing import Any
 
 import torch
@@ -17,69 +16,19 @@ from torch.nn import functional as F
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.ncp_olmo.dflash import (
     VERIFICATION_MODES,
-    get_ncp_dflash_target,
+    DFlashConceptLMDFlashModel,
     original_draft_config,
     validate_ncp_dflash_config,
 )
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
-
-
-def _parse_active_batch_widths(
-    raw_policy: str,
-    maximum_width: int,
-) -> tuple[tuple[int, int], ...]:
-    """Parse active-decode-batch upper bounds into proposal-width caps."""
-
-    raw_policy = raw_policy.strip()
-    if not raw_policy:
-        return ()
-    buckets: dict[int, int] = {}
-    for raw_bucket in raw_policy.split(","):
-        upper_text, separator, width_text = raw_bucket.strip().partition(":")
-        if not separator:
-            raise ValueError(
-                "NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS must use "
-                "comma-separated upper_bound:width entries"
-            )
-        upper_bound = int(upper_text)
-        width = int(width_text)
-        if upper_bound < 1:
-            raise ValueError("DFlash active-batch upper bounds must be positive")
-        if not 0 <= width <= maximum_width:
-            raise ValueError(
-                "DFlash active-batch width must be between zero and the "
-                f"configured speculative width: width={width} "
-                f"maximum={maximum_width}"
-            )
-        if upper_bound in buckets:
-            raise ValueError(
-                f"duplicate DFlash active-batch upper bound: {upper_bound}"
-            )
-        buckets[upper_bound] = width
-    return tuple(sorted(buckets.items()))
-
-
-def _read_positive_env_int(
-    name: str,
-    *,
-    default: int,
-    legacy_name: str | None = None,
-) -> int:
-    """Read a positive integer while accepting the internal legacy name."""
-
-    raw_value = os.environ.get(name)
-    if raw_value is None and legacy_name is not None:
-        raw_value = os.environ.get(legacy_name)
-    value = default if raw_value is None else int(raw_value)
-    if value < 1:
-        raise ValueError(f"{name} must be at least 1")
-    return value
 
 
 def _dflash_sdpa_mask(
@@ -513,29 +462,44 @@ def _flash_varlen_dflash_attention(
     )
 
 
-def _install_draft_attention_backend(model: torch.nn.Module) -> str:
-    backend = os.environ.get("NCP_OLMO_DFLASH_ATTENTION_BACKEND", "sdpa")
+def _install_draft_attention_backend(
+    model: torch.nn.Module,
+    backend: str,
+) -> str:
+    """Install an attention implementation only on this draft instance."""
+
     if backend not in {"flash_varlen", "sdpa", "flex_attention"}:
         raise ValueError(
-            "NCP_OLMO_DFLASH_ATTENTION_BACKEND must be flash_varlen, sdpa, "
-            "or flex_attention"
+            "NCP DFlash attention backend must be flash_varlen, sdpa, or flex_attention"
         )
     model.config.flex_attention_compile = False
     if backend == "flex_attention":
         return backend
 
-    # The remote model always builds a FlexAttention BlockMask before calling
-    # its layers. SDPA implements the same visibility rule above, so disable
-    # only this process-local helper. The checkpoint remains untouched.
-    forward_function = getattr(model.forward, "__func__", model.forward)
-    forward_globals = getattr(forward_function, "__globals__", None)
+    forward = getattr(model.forward, "__func__", model.forward)
+    forward_globals = getattr(forward, "__globals__", None)
     if not isinstance(forward_globals, dict) or (
         "_create_dflash_block_mask" not in forward_globals
     ):
         raise RuntimeError(
             "DFlash remote model no longer exposes its block-mask helper"
         )
-    forward_globals["_create_dflash_block_mask"] = lambda *_args, **_kwargs: None
+    local_globals = dict(forward_globals)
+    local_globals["_create_dflash_block_mask"] = lambda *_args, **_kwargs: None
+    local_forward = FunctionType(
+        forward.__code__,
+        local_globals,
+        forward.__name__,
+        forward.__defaults__,
+        forward.__closure__,
+    )
+    local_forward.__kwdefaults__ = forward.__kwdefaults__
+    local_forward.__annotations__ = forward.__annotations__
+    local_forward.__dict__.update(forward.__dict__)
+    local_forward.__module__ = forward.__module__
+    local_forward.__qualname__ = forward.__qualname__
+    model.forward = MethodType(local_forward, model)
+
     for layer in model.layers:
         layer.flex_attention_compile = False
         attention = (
@@ -547,7 +511,7 @@ def _install_draft_attention_backend(model: torch.nn.Module) -> str:
     return backend
 
 
-class NCPDFlashSpeculator(BaseSpeculator):
+class NCPDFlashSpeculator(DraftModelSpeculator):
     """Draft from NCP target features while target verification stays authoritative."""
 
     supports_mm_inputs = False
@@ -567,54 +531,42 @@ class NCPDFlashSpeculator(BaseSpeculator):
         self.max_model_len = int(vllm_config.model_config.max_model_len)
         self.max_num_reqs = int(vllm_config.scheduler_config.max_num_seqs)
         self.dtype = vllm_config.model_config.dtype
-        self.checkpoint = str(speculative_config.model)
         if not speculative_config.draft_model_config.trust_remote_code:
             raise ValueError(
                 "NCP DFlash checkpoints contain their Hugging Face draft model; "
                 "pass --trust-remote-code to opt in to loading it"
             )
 
-        self.verification_mode = os.environ.get(
-            "NCP_OLMO_DFLASH_VERIFICATION_MODE",
-            "sequential_exact",
-        )
+        self.verification_mode = speculative_config.ncp_dflash_verification_mode
         if self.verification_mode not in VERIFICATION_MODES:
             raise ValueError(
-                "NCP_OLMO_DFLASH_VERIFICATION_MODE must be one of "
+                "NCP DFlash verification mode must be one of "
                 f"{sorted(VERIFICATION_MODES)!r}"
             )
-        raw_active_batch_widths = os.environ.get(
-            "NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS",
-            os.environ.get("CONCEPTLM_DFLASH_ACTIVE_BATCH_WIDTHS", ""),
+        schedule = speculative_config.num_speculative_tokens_per_batch_size
+        self.active_batch_width_lookup = (
+            None
+            if schedule is None
+            else build_dynamic_sd_schedule_lookup(
+                schedule,
+                vllm_max_batch_size=self.max_num_reqs,
+                vllm_num_speculative_tokens=self.num_speculative_steps,
+            )
         )
-        self.active_batch_widths = _parse_active_batch_widths(
-            raw_active_batch_widths,
-            self.num_speculative_steps,
-        )
-        self.context_kv_cache = (
-            os.environ.get("NCP_OLMO_DFLASH_CONTEXT_KV_CACHE", "1") == "1"
-        )
+        self.context_kv_cache = speculative_config.ncp_dflash_context_kv_cache
         self.sparse_context_projection = (
-            os.environ.get("NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION", "1") == "1"
+            speculative_config.ncp_dflash_sparse_context_projection
         )
         if self.sparse_context_projection and not self.context_kv_cache:
             raise ValueError(
                 "NCP DFlash sparse context projection requires context KV cache"
             )
-        self.min_eligible_batch = _read_positive_env_int(
-            "NCP_OLMO_DFLASH_MIN_ELIGIBLE_BATCH",
-            default=1,
-            legacy_name="CONCEPTLM_DFLASH_MIN_ELIGIBLE_BATCH",
+        self.min_eligible_batch = int(speculative_config.ncp_dflash_min_eligible_batch)
+        self.min_proposal_tokens_per_row = int(
+            speculative_config.ncp_dflash_min_proposal_tokens_per_row
         )
-        self.min_proposal_tokens_per_row = _read_positive_env_int(
-            "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW",
-            default=1,
-            legacy_name="CONCEPTLM_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW",
-        )
-        self.min_proposal_tokens_per_batch = _read_positive_env_int(
-            "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH",
-            default=1,
-            legacy_name="CONCEPTLM_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH",
+        self.min_proposal_tokens_per_batch = int(
+            speculative_config.ncp_dflash_min_proposal_tokens_per_batch
         )
         self.chunk_size = int(self.draft_config.concept_chunk_size)
         self.draft_tokens = torch.full(
@@ -628,6 +580,11 @@ class NCPDFlashSpeculator(BaseSpeculator):
         # this attribute for every speculator implementation.
         self.draft_logits: torch.Tensor | None = None
         self._draft_model: torch.nn.Module | None = None
+        self.target_model: torch.nn.Module | None = None
+        # The remote NCP drafter owns request-local attention state instead of
+        # registering vLLM AttentionLayerBase instances in the target config.
+        # ModelRunner still reads this attribute for every DraftModelSpeculator.
+        self.draft_attn_layer_names: set[str] = set()
         self._logged_first_proposal = False
         self._last_context_kv_cache_stats: dict[str, Any] = {
             "enabled": self.context_kv_cache,
@@ -637,12 +594,12 @@ class NCPDFlashSpeculator(BaseSpeculator):
         self._last_proposal_stats: dict[str, Any] = {}
         logger.info(
             "NCP DFlash enabled with verification_mode=%s, proposal_width=%d, "
-            "active_batch_widths=%s, context_kv_cache=%s, and "
+            "dynamic_width_schedule=%s, context_kv_cache=%s, and "
             "sparse_context_projection=%s, min_eligible_batch=%d, "
             "min_tokens_per_row=%d, and min_tokens_per_batch=%d",
             self.verification_mode,
             self.num_speculative_steps,
-            self.active_batch_widths or "static",
+            schedule or "static",
             self.context_kv_cache,
             self.sparse_context_projection,
             self.min_eligible_batch,
@@ -656,18 +613,26 @@ class NCPDFlashSpeculator(BaseSpeculator):
     def capture(self) -> None:
         return None
 
-    def _load_draft(self) -> torch.nn.Module:
-        if self._draft_model is not None:
-            return self._draft_model
-        from transformers import AutoModel
+    def load_draft_model(
+        self,
+        target_model: torch.nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> torch.nn.Module:
+        """Load the draft through vLLM and bind its explicit target instance."""
 
-        model = AutoModel.from_pretrained(
-            self.checkpoint,
-            trust_remote_code=True,
-            dtype=self.dtype,
-            low_cpu_mem_usage=True,
-        ).to(self.device)
-        model.eval()
+        del target_attn_layer_names
+        self.target_model = target_model
+        wrapper = get_model(
+            vllm_config=self.vllm_config,
+            model_config=self.speculative_config.draft_model_config,
+            load_config=self.speculative_config.draft_load_config,
+        )
+        if not isinstance(wrapper, DFlashConceptLMDFlashModel):
+            raise TypeError(
+                "NCP DFlash loader returned an unexpected model type: "
+                f"{type(wrapper).__name__}"
+            )
+        model = wrapper.model
         if hasattr(model, "gradient_checkpointing"):
             model.gradient_checkpointing = False
         model.config.gradient_checkpointing = False
@@ -685,15 +650,15 @@ class NCPDFlashSpeculator(BaseSpeculator):
             raise ValueError(
                 "loaded draft block_size is smaller than the proposal width"
             )
-        self._draft_runtime_max_block_size = min(
-            int(model.config.block_size),
-            self.num_speculative_steps,
-        )
+        self._draft_runtime_max_block_size = int(model.config.block_size)
         if str(model.config.proposal_method) != "path_selector":
             raise ValueError("loaded NCP drafter must use path_selector")
         if str(model.config.hlm_conditioning) != "causal_residual":
             raise ValueError("loaded NCP drafter must use causal_residual HLM state")
-        attention_backend = _install_draft_attention_backend(model)
+        attention_backend = _install_draft_attention_backend(
+            model,
+            self.speculative_config.ncp_dflash_attention_backend,
+        )
         if attention_backend == "flash_varlen" and not self.context_kv_cache:
             raise ValueError(
                 "flash_varlen NCP DFlash attention requires request-local "
@@ -701,7 +666,28 @@ class NCPDFlashSpeculator(BaseSpeculator):
             )
         logger.info("NCP DFlash draft attention backend: %s", attention_backend)
         self._draft_model = model
-        return model
+        return wrapper
+
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        """Load the draft once during the runner's accounted loading phase."""
+
+        self.draft_attn_layer_names = set()
+        self.model = self.load_draft_model(target_model, set())
+
+    def set_attn(self, *args: Any, **kwargs: Any) -> None:
+        """Keep the remote drafter outside vLLM's target KV-cache plumbing."""
+
+        del args, kwargs
+
+    def _require_draft_model(self) -> torch.nn.Module:
+        if self._draft_model is None:
+            raise RuntimeError("NCP DFlash draft model has not been loaded")
+        return self._draft_model
+
+    def _require_target_model(self) -> torch.nn.Module:
+        if self.target_model is None:
+            raise RuntimeError("NCP DFlash target model has not been bound")
+        return self.target_model
 
     def _active_batch_width(self, active_batch_size: int) -> int:
         """Return the proposal cap for the current continuous-batch step."""
@@ -709,12 +695,10 @@ class NCPDFlashSpeculator(BaseSpeculator):
         active_batch_size = int(active_batch_size)
         if active_batch_size <= 0:
             return 0
-        if not self.active_batch_widths:
+        if self.active_batch_width_lookup is None:
             return self.num_speculative_steps
-        for upper_bound, width in self.active_batch_widths:
-            if active_batch_size <= upper_bound:
-                return width
-        return self.active_batch_widths[-1][1]
+        lookup_index = min(active_batch_size, len(self.active_batch_width_lookup) - 1)
+        return self.active_batch_width_lookup[lookup_index]
 
     def safe_proposal_count(
         self,
@@ -1007,7 +991,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
         anchor_ids: torch.Tensor,
         proposal_counts: list[int],
     ) -> torch.Tensor:
-        target = get_ncp_dflash_target()
+        target = self._require_target_model()
         contexts = []
         hlm_states = []
         embedding_weight: torch.Tensor | None = None
@@ -1034,7 +1018,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
             hlm_states.append(hlm_state)
         assert embedding_weight is not None and output_weight is not None
 
-        draft = self._load_draft()
+        draft = self._require_draft_model()
         if int(draft.config.vocab_size) != int(embedding_weight.shape[0]):
             raise ValueError("NCP target and draft vocabulary sizes do not match")
         proposal_block_size = max(proposal_counts)
@@ -1044,10 +1028,10 @@ class NCPDFlashSpeculator(BaseSpeculator):
                 "NCP DFlash proposal block exceeds the loaded runtime block: "
                 f"proposal={proposal_block_size} runtime={runtime_max_block_size}"
             )
-        # The remote drafter constructs its slot tensor from config.block_size.
-        # Compute only the width selected for this scheduler step instead of
-        # the checkpoint's full trained block and discarding the suffix.
-        draft.config.block_size = proposal_block_size
+        # Keep the trained checkpoint contract immutable. The remote model
+        # computes its fixed block and the selector consumes only the scheduler-
+        # selected prefix below. A future variable-width kernel can optimize
+        # this without mutating shared model configuration at runtime.
         anchor_embeddings = embedding_weight[anchor_ids].unsqueeze(1)
         mask_embedding = embedding_weight[int(draft.config.mask_token_id)]
         anchor_positions = torch.tensor(
@@ -1211,7 +1195,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
         num_reqs = int(input_batch.num_reqs)
         result = self.draft_tokens[:num_reqs]
         result.fill_(-1)
-        self._load_draft()
+        self._require_draft_model()
         if dummy_run:
             return result
         if input_batch.req_ids and all(
@@ -1247,7 +1231,7 @@ class NCPDFlashSpeculator(BaseSpeculator):
         if anchor_ids.ndim != 1:
             raise RuntimeError("NCP DFlash expected one sampled anchor per request")
         anchor_ids = anchor_ids.to(dtype=torch.long)
-        target = get_ncp_dflash_target()
+        target = self._require_target_model()
         eligible_rows = []
         eligible_request_ids = []
         eligible_anchor_ids = []

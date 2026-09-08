@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""NCP-OLMo DFlash configuration and target-model rendezvous helpers."""
+"""NCP-OLMo DFlash configuration and draft-model wrapper."""
 
 from __future__ import annotations
 
-import weakref
+from collections.abc import Iterable
 from typing import Any
 
 import torch
 import torch.nn as nn
+
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 DRAFT_ARCHITECTURE = "DFlashConceptLMDFlashModel"
 VERIFICATION_MODES = {
@@ -17,8 +19,6 @@ VERIFICATION_MODES = {
     "intra_chunk_exact",
     "segmented_kv_approx",
 }
-
-_target_model_ref: weakref.ReferenceType[nn.Module] | None = None
 
 
 def is_ncp_dflash_config(vllm_config: Any) -> bool:
@@ -70,54 +70,44 @@ def validate_ncp_dflash_config(vllm_config: Any) -> tuple[int, ...]:
     return target_layer_ids
 
 
-def register_ncp_dflash_target(model: nn.Module) -> None:
-    """Register the process-local target consumed by the V2 speculator."""
-
-    global _target_model_ref
-    existing = None if _target_model_ref is None else _target_model_ref()
-    if existing is not None and existing is not model:
-        raise RuntimeError("only one NCP DFlash target may be active per process")
-    _target_model_ref = weakref.ref(model)
-
-
-def get_ncp_dflash_target() -> nn.Module:
-    """Return the live process-local NCP target or fail closed."""
-
-    target = None if _target_model_ref is None else _target_model_ref()
-    if target is None:
-        raise RuntimeError("the NCP DFlash target model has not been constructed")
-    return target
-
-
 class DFlashConceptLMDFlashModel(nn.Module):
-    """Registry-only marker for the remote-code NCP DFlash checkpoint.
+    """Load the self-contained NCP DFlash checkpoint through vLLM.
 
-    The V2 NCP speculator loads the self-contained Hugging Face draft model
-    directly. This class lets ``ModelConfig`` inspect the wrapped architecture
-    without accidentally routing it through the incompatible generic Qwen
-    DFlash implementation.
+    The checkpoint provides a Transformers remote-code model. Constructing it
+    here keeps draft allocation, checkpoint loading, dummy initialization, and
+    peak-memory accounting inside vLLM's normal model-loader lifecycle.
     """
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
-        del vllm_config, prefix
-        raise RuntimeError(
-            "DFlashConceptLMDFlashModel is loaded by NCPDFlashSpeculator, "
-            "not by the generic vLLM model loader"
+        del prefix
+        from transformers import AutoModel
+
+        config = original_draft_config(vllm_config)
+        self.model = AutoModel.from_config(
+            config,
+            trust_remote_code=True,
         )
+        self.config = self.model.config
+
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> set[str]:
+        """Load the flat remote-code checkpoint with vLLM tracking enabled."""
+
+        loaded = AutoWeightsLoader(self.model).load_weights(weights)
+        return {f"model.{name}" for name in loaded}
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Any | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return self.model(*args, **kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         raise NotImplementedError
-

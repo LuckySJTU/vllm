@@ -483,6 +483,35 @@ class SpeculativeConfig:
     inclusive batch-size range.
     """
 
+    ncp_dflash_verification_mode: Literal[
+        "sequential_exact",
+        "intra_chunk_exact",
+        "segmented_kv_approx",
+    ] = "sequential_exact"
+    """NCP DFlash state contract. The cross-chunk mode is experimental."""
+
+    ncp_dflash_attention_backend: Literal[
+        "sdpa",
+        "flash_varlen",
+        "flex_attention",
+    ] = "sdpa"
+    """Object-local attention implementation used by the NCP DFlash draft."""
+
+    ncp_dflash_context_kv_cache: bool = True
+    """Cache request-owned NCP DFlash context key/value projections."""
+
+    ncp_dflash_sparse_context_projection: bool = True
+    """Project only uncached NCP DFlash target-feature suffixes."""
+
+    ncp_dflash_min_eligible_batch: int = Field(default=1, ge=1)
+    """Minimum eligible decode rows before running the NCP DFlash draft."""
+
+    ncp_dflash_min_proposal_tokens_per_row: int = Field(default=1, ge=1)
+    """Minimum safe NCP DFlash width for an individual request row."""
+
+    ncp_dflash_min_proposal_tokens_per_batch: int = Field(default=1, ge=1)
+    """Minimum total NCP DFlash proposal budget for one scheduler step."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -631,6 +660,22 @@ class SpeculativeConfig:
             if layer_ids is not None and uses_aux_hidden_states:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
+
+            draft_hf_config = self.draft_model_config.hf_config
+            draft_hf_config = getattr(draft_hf_config, "model", draft_hf_config)
+            if getattr(draft_hf_config, "model_type", None) == "conceptlm_dflash":
+                factors.extend(
+                    (
+                        self.ncp_dflash_verification_mode,
+                        self.ncp_dflash_attention_backend,
+                        self.ncp_dflash_context_kv_cache,
+                        self.ncp_dflash_sparse_context_projection,
+                        self.ncp_dflash_min_eligible_batch,
+                        self.ncp_dflash_min_proposal_tokens_per_row,
+                        self.ncp_dflash_min_proposal_tokens_per_batch,
+                        self.num_speculative_tokens_per_batch_size,
+                    )
+                )
 
         if self.method == "mtp" and self.draft_model_config is not None:
             factors.append(
@@ -1292,10 +1337,7 @@ class SpeculativeConfig:
                     config_format=self.target_model_config.config_format,
                 )
 
-                if (
-                    self.draft_model_config.hf_config.model_type
-                    == "conceptlm_dflash"
-                ):
+                if self.draft_model_config.hf_config.model_type == "conceptlm_dflash":
                     self.disable_padded_drafter_batch = True
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
@@ -1808,6 +1850,30 @@ class SpeculativeConfig:
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
                 "are only valid with rejection_sample_method='synthetic'."
             )
+
+        if self.draft_model_config is not None:
+            draft_hf_config = self.draft_model_config.hf_config
+            draft_hf_config = getattr(draft_hf_config, "model", draft_hf_config)
+            is_ncp_dflash = (
+                getattr(draft_hf_config, "model_type", None) == "conceptlm_dflash"
+            )
+            if is_ncp_dflash:
+                if (
+                    self.ncp_dflash_sparse_context_projection
+                    and not self.ncp_dflash_context_kv_cache
+                ):
+                    raise ValueError(
+                        "NCP DFlash sparse context projection requires its "
+                        "request-local context KV cache"
+                    )
+                if (
+                    self.ncp_dflash_attention_backend == "flash_varlen"
+                    and not self.ncp_dflash_context_kv_cache
+                ):
+                    raise ValueError(
+                        "NCP DFlash flash_varlen attention requires its "
+                        "request-local context KV cache"
+                    )
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(

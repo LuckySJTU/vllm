@@ -255,6 +255,8 @@ def test_chunked_prefill_preemption_and_refill_match_sequential(
         0,
     )
     assert preemptions_after > preemptions_before
+
+
 @pytest.mark.skipif(
     not DFLASH_MODEL,
     reason="NCP_OLMO_DFLASH_TEST_MODEL must point to the matching draft checkpoint",
@@ -305,16 +307,18 @@ def test_dflash_continuous_refill_matches_target_only(
         return [list(output.outputs[0].token_ids) for output in outputs]
 
     target_only = generate(None)
-    monkeypatch.setenv("NCP_OLMO_DFLASH_VERIFICATION_MODE", "sequential_exact")
-    monkeypatch.setenv(
-        "NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS",
-        "1:8,2:8,4:4,8:2",
-    )
     with_dflash = generate(
         {
             "model": DFLASH_MODEL,
             "method": "dflash",
             "num_speculative_tokens": 8,
+            "num_speculative_tokens_per_batch_size": [
+                (1, 1, 8),
+                (2, 2, 8),
+                (3, 4, 4),
+                (5, 8, 2),
+            ],
+            "ncp_dflash_verification_mode": "sequential_exact",
         }
     )
 

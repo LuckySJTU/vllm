@@ -4,14 +4,21 @@
 """Contract tests for NCP-OLMo's matching DFlash checkpoint."""
 
 import sys
-from types import ModuleType, SimpleNamespace
+from argparse import Namespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+from examples.offline_inference.ncp_olmo import (
+    _build_speculative_config,
+    _parse_dflash_batch_widths,
+)
+from vllm.config import SpeculativeConfig
 from vllm.model_executor.models.ncp_olmo.dflash import (
     DRAFT_ARCHITECTURE,
+    DFlashConceptLMDFlashModel,
     is_ncp_dflash_config,
     original_draft_config,
     validate_ncp_dflash_config,
@@ -21,10 +28,19 @@ from vllm.v1.worker.gpu.spec_decode.ncp_dflash import (
     _dflash_context_kv,
     _dflash_sdpa_mask,
     _flash_varlen_dflash_attention,
-    _parse_active_batch_widths,
+    _install_draft_attention_backend,
     _sdpa_dflash_attention,
 )
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+
+
+def _create_dflash_block_mask() -> str:
+    return "original"
+
+
+def _remote_forward_for_test(_model: object) -> str | None:
+    return _create_dflash_block_mask()
 
 
 class _CountingProjection(torch.nn.Linear):
@@ -86,6 +102,8 @@ def test_ncp_dflash_config_is_recognized_and_unwrapped() -> None:
     assert original_draft_config(config).model_type == "conceptlm_dflash"
     assert validate_ncp_dflash_config(config) == (1, 4, 7, 10, 13)
     assert not NCPDFlashSpeculator.requires_aux_hidden_states
+    assert issubclass(NCPDFlashSpeculator, DraftModelSpeculator)
+    assert not DraftModelSpeculator.variable_draft_lengths
 
 
 @pytest.mark.parametrize(
@@ -136,10 +154,7 @@ def test_proposal_windows_keep_exact_modes_inside_hlm_chunk() -> None:
 def test_active_batch_policy_preserves_validated_width_schedule() -> None:
     speculator = object.__new__(NCPDFlashSpeculator)
     speculator.num_speculative_steps = 8
-    speculator.active_batch_widths = _parse_active_batch_widths(
-        "1:8,2:8,4:4,8:2",
-        maximum_width=8,
-    )
+    speculator.active_batch_width_lookup = [0, 8, 8, 4, 4, 2, 2, 2, 2]
 
     assert [speculator._active_batch_width(size) for size in range(0, 10)] == [
         0,
@@ -203,8 +218,8 @@ def test_batch_gate_skips_only_low_value_multi_request_steps() -> None:
     ("policy", "message"),
     [
         ("0:1", "upper bounds"),
-        ("1:9", "configured speculative width"),
-        ("1:8,1:4", "duplicate"),
+        ("1:9", "between zero"),
+        ("1:8,1:4", "upper bounds"),
         ("1", "upper_bound:width"),
     ],
 )
@@ -213,7 +228,206 @@ def test_active_batch_policy_rejects_invalid_entries(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        _parse_active_batch_widths(policy, maximum_width=8)
+        _parse_dflash_batch_widths(policy, maximum_width=8)
+
+
+def test_example_builds_typed_dflash_config() -> None:
+    args = Namespace(
+        draft_model="draft",
+        num_speculative_tokens=8,
+        dflash_verification_mode="intra_chunk_exact",
+        dflash_attention_backend="sdpa",
+        dflash_context_kv_cache=True,
+        dflash_sparse_context_projection=True,
+        dflash_min_eligible_batch=2,
+        dflash_min_proposal_tokens_per_row=2,
+        dflash_min_proposal_tokens_per_batch=8,
+        dflash_active_batch_widths="1:8,2:8,4:4,8:2",
+    )
+
+    config = _build_speculative_config(args)
+
+    assert config is not None
+    assert config["ncp_dflash_verification_mode"] == "intra_chunk_exact"
+    assert config["num_speculative_tokens_per_batch_size"] == [
+        (1, 1, 8),
+        (2, 2, 8),
+        (3, 4, 4),
+        (5, 8, 2),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "ncp_dflash_context_kv_cache": False,
+                "ncp_dflash_sparse_context_projection": True,
+            },
+            "sparse context projection",
+        ),
+        (
+            {
+                "ncp_dflash_attention_backend": "flash_varlen",
+                "ncp_dflash_context_kv_cache": False,
+                "ncp_dflash_sparse_context_projection": False,
+            },
+            "flash_varlen attention",
+        ),
+    ],
+)
+def test_typed_dflash_config_rejects_incompatible_cache_settings(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model=SimpleNamespace(model_type="conceptlm_dflash")),
+        verify_with_parallel_config=lambda _config: None,
+    )
+    config = object.__new__(SpeculativeConfig)
+    values = {
+        "tensor_parallel_size": None,
+        "num_speculative_tokens": 8,
+        "rejection_sample_method": "standard",
+        "synthetic_acceptance_rates": None,
+        "synthetic_acceptance_length": None,
+        "draft_model_config": draft_model_config,
+        "draft_parallel_config": None,
+        "ncp_dflash_attention_backend": "sdpa",
+        "ncp_dflash_context_kv_cache": True,
+        "ncp_dflash_sparse_context_projection": True,
+        **overrides,
+    }
+    for name, value in values.items():
+        object.__setattr__(config, name, value)
+
+    with pytest.raises(ValueError, match=message):
+        config._verify_args()
+
+
+def test_remote_draft_uses_vllm_weight_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_model = torch.nn.Linear(2, 2, bias=False)
+    remote_model.config = SimpleNamespace()
+    observed: dict[str, object] = {}
+
+    def from_config(config: object, trust_remote_code: bool) -> torch.nn.Module:
+        observed["config"] = config
+        observed["trust_remote_code"] = trust_remote_code
+        return remote_model
+
+    import transformers
+
+    monkeypatch.setattr(transformers.AutoModel, "from_config", from_config)
+    config = make_config()
+    wrapper = DFlashConceptLMDFlashModel(vllm_config=config)
+    loaded = wrapper.load_weights(
+        [("weight", torch.arange(4, dtype=torch.float32).reshape(2, 2))]
+    )
+
+    assert wrapper.model is remote_model
+    assert observed == {
+        "config": original_draft_config(config),
+        "trust_remote_code": True,
+    }
+    assert loaded == {"model.weight"}
+    torch.testing.assert_close(
+        remote_model.weight,
+        torch.arange(4, dtype=torch.float32).reshape(2, 2),
+    )
+
+
+def test_speculator_loads_draft_and_binds_target_during_runner_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="conceptlm_dflash",
+            target_layer_ids=[1, 4, 7, 10, 13],
+            block_size=16,
+            proposal_method="path_selector",
+            hlm_conditioning="causal_residual",
+            gradient_checkpointing=True,
+            flex_attention_compile=True,
+        ),
+        gradient_checkpointing=True,
+        layers=[SimpleNamespace()],
+    )
+    remote_model.forward = MethodType(_remote_forward_for_test, remote_model)
+    wrapper = object.__new__(DFlashConceptLMDFlashModel)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.model = remote_model
+    speculator = object.__new__(NCPDFlashSpeculator)
+    speculator.vllm_config = SimpleNamespace()
+    speculator.speculative_config = SimpleNamespace(
+        draft_model_config=SimpleNamespace(),
+        draft_load_config=None,
+        ncp_dflash_attention_backend="sdpa",
+    )
+    speculator.target_layer_ids = (1, 4, 7, 10, 13)
+    speculator.num_speculative_steps = 8
+    speculator.context_kv_cache = True
+    speculator._draft_model = None
+    speculator.target_model = None
+    observed: dict[str, object] = {}
+
+    def fake_get_model(**kwargs: object) -> torch.nn.Module:
+        observed.update(kwargs)
+        return wrapper
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.ncp_dflash.get_model",
+        fake_get_model,
+    )
+    target = torch.nn.Identity()
+
+    speculator.load_model(target)
+
+    assert speculator.target_model is target
+    assert speculator.model is wrapper
+    assert speculator._draft_model is remote_model
+    assert speculator.draft_attn_layer_names == set()
+    assert observed["model_config"] is speculator.speculative_config.draft_model_config
+    assert remote_model.gradient_checkpointing is False
+    assert remote_model.config.gradient_checkpointing is False
+
+
+def test_speculator_does_not_register_remote_attention_with_target_cache() -> None:
+    speculator = object.__new__(NCPDFlashSpeculator)
+
+    speculator.set_attn(object(), object(), object(), object(), object())
+
+    assert not hasattr(speculator, "attn_groups")
+
+
+def test_attention_backend_is_installed_on_draft_instance_only() -> None:
+    layer = SimpleNamespace()
+    model = SimpleNamespace(
+        config=SimpleNamespace(flex_attention_compile=True),
+        layers=[layer],
+    )
+    model.forward = MethodType(_remote_forward_for_test, model)
+
+    assert _install_draft_attention_backend(model, "sdpa") == "sdpa"
+    assert layer._attention.__self__ is layer
+    assert layer._attention.__func__ is _sdpa_dflash_attention
+    assert model.config.flex_attention_compile is False
+    assert model.forward() is None
+    assert _remote_forward_for_test(model) == "original"
+
+
+def test_target_binding_is_explicit_and_fails_closed() -> None:
+    speculator = object.__new__(NCPDFlashSpeculator)
+    speculator.target_model = None
+
+    with pytest.raises(RuntimeError, match="target model has not been bound"):
+        speculator._require_target_model()
+
+    target = torch.nn.Identity()
+    speculator.target_model = target
+    assert speculator._require_target_model() is target
 
 
 def test_sdpa_mask_matches_dflash_context_and_block_visibility() -> None:

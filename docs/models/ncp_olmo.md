@@ -124,8 +124,11 @@ python examples/offline_inference/ncp_olmo.py /path/to/pure-hf-model \
 
 The DFlash checkpoint supplies executable Hugging Face model code, so loading
 it is covered by the example's explicit `trust_remote_code=True`. Review the
-checkpoint code before using an untrusted source. To reproduce the experimental
-cross-chunk mode, add `--dflash-verification-mode segmented_kv_approx`.
+checkpoint code before using an untrusted source. vLLM constructs and loads the
+draft during the runner's normal model-loading phase, so its allocation, dummy
+initialization, and peak memory are accounted with the target rather than being
+hidden behind a lazy first request. To reproduce the experimental cross-chunk
+mode, add `--dflash-verification-mode segmented_kv_approx`.
 The downstream-gated adaptive quality preset uses a maximum width of eight and
 caps it by the number of active decode requests: `1 -> 8`, `2 -> 8`, `3-4 -> 4`,
 and `5-8 -> 2`. It remains opt-in because it is paired with the approximate
@@ -142,22 +145,21 @@ python examples/offline_inference/ncp_olmo.py /path/to/pure-hf-model \
 
 The active batch is recomputed from decode rows on every proposal step, so
 request completion and refill immediately select a new width. The scheduler
-still reserves the configured maximum width; invalid suffix entries remain
-`-1` and are trimmed before target verification. The remote drafter's runtime
-block is also reduced to the largest proposal width selected in that step, so
-the width policy changes computation rather than only trimming returned IDs.
+and proposer share vLLM's typed dynamic speculative-decoding schedule; invalid
+suffix entries remain `-1` and are trimmed before target verification. The
+remote drafter keeps its trained fixed block size immutable and the selector
+consumes the scheduled prefix. A future variable-width draft kernel can reduce
+this compute without mutating shared checkpoint configuration at runtime.
 Exact modes still cap every row at the remaining safe positions in its current
 HLM chunk. With the current four-token chunk contract this normally emits one
 or two draft tokens, even when the configured adaptive width is larger. Only
 `segmented_kv_approx` uses the full cross-chunk adaptive widths.
 
-Three optional profitability gates can bypass proposal work when the active
+Three typed speculative-config fields can bypass proposal work when the active
 decode set is too small. Their defaults are all one, which preserves the normal
-proposal path:
-
-- `NCP_OLMO_DFLASH_MIN_ELIGIBLE_BATCH`
-- `NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW`
-- `NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH`
+proposal path: `ncp_dflash_min_eligible_batch`,
+`ncp_dflash_min_proposal_tokens_per_row`, and
+`ncp_dflash_min_proposal_tokens_per_batch`.
 
 The first gate applies when the engine is configured for more than one request.
 The other two gates remove rows with too little safe work and then require a
@@ -171,22 +173,20 @@ The DFlash attention path keeps request-owned context K/V and projects only
 the newly committed target-feature suffix on later proposal steps. Cache keys
 are request IDs rather than row indices, so continuous-batch removal, refill,
 and row reordering cannot exchange state. Released requests are pruned. Set
-`NCP_OLMO_DFLASH_CONTEXT_KV_CACHE=0` and
-`NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION=0` together only for a reference
-run that recomputes the complete draft context. The equivalent example options
-are `--no-dflash-context-kv-cache` and
-`--no-dflash-sparse-context-projection`.
+`ncp_dflash_context_kv_cache=false` and
+`ncp_dflash_sparse_context_projection=false` together only for a reference run
+that recomputes the complete draft context. The equivalent example options are
+`--no-dflash-context-kv-cache` and `--no-dflash-sparse-context-projection`.
 
 The draft uses an inference-only SDPA implementation of the checkpoint's
-FlexAttention visibility rule by default. Set
-`NCP_OLMO_DFLASH_ATTENTION_BACKEND=flash_varlen` to pack the request-local
-context K/V rows and execute the same one-anchor visibility rule with
-FlashAttention Varlen. This backend requires the request-local context K/V
-cache. It is opt-in: kernel-level numerical differences can change draft
-accept/reject telemetry even when exact-mode final target tokens are unchanged.
-Use `NCP_OLMO_DFLASH_ATTENTION_BACKEND=flex_attention` only when debugging the
-checkpoint's original attention implementation. The offline example exposes
-these choices as `--dflash-attention-backend`.
+FlexAttention visibility rule by default. Set the typed
+`ncp_dflash_attention_backend` field to `flash_varlen` to pack request-local
+context K/V and run the same one-anchor visibility rule with FlashAttention
+Varlen. This backend requires the request-local context K/V cache. It is opt-in:
+kernel-level numerical differences can change draft accept/reject telemetry
+even when exact-mode final target tokens are unchanged. Use `flex_attention`
+only when debugging the checkpoint's original attention implementation. The
+offline example exposes these choices as `--dflash-attention-backend`.
 
 To use FlashInfer sampling while keeping vLLM's default attention selection:
 

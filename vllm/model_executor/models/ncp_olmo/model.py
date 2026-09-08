@@ -23,7 +23,6 @@ from .contract import NCPOlmo3BackendConfig
 from .dflash import (
     is_ncp_dflash_config,
     original_draft_config,
-    register_ncp_dflash_target,
     validate_ncp_dflash_config,
 )
 from .hlm import ConceptLMHighLevelBranch
@@ -174,8 +173,6 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
         self._pending_stage_trace: dict[str, torch.Tensor] | None = None
         trace_dir = os.environ.get("CONCEPTLM_VLLM_LOGITS_TRACE_DIR")
         self._logits_trace_dir = Path(trace_dir) if trace_dir else None
-        if self._ncp_dflash_enabled:
-            register_ncp_dflash_target(self)
 
     @staticmethod
     def get_model_state_cls() -> type[Any]:
@@ -312,8 +309,7 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
             if (
                 transaction.encoder_final is None
                 or not transaction.encoder_layers
-                or len(transaction.decoder_layers)
-                != len(self._draft_capture_layer_ids)
+                or len(transaction.decoder_layers) != len(self._draft_capture_layer_ids)
             ):
                 raise RuntimeError(
                     f"NCP DFlash transaction features are incomplete for {req_id!r}"
@@ -391,9 +387,7 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
         ]
         if context_length:
             context = torch.stack(layer_values, dim=1).unsqueeze(0)
-            anchor_row = context.new_zeros(
-                (1, 1, len(layer_values), context.shape[-1])
-            )
+            anchor_row = context.new_zeros((1, 1, len(layer_values), context.shape[-1]))
             context = torch.cat((context, anchor_row), dim=1)
         else:
             context = embedding_weight.new_zeros(

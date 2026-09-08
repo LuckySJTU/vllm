@@ -7,14 +7,18 @@ import argparse
 import os
 
 
-def positive_int(value: str) -> int:
+def _positive_int(value: str) -> int:
+    """Parse a positive command-line integer."""
+
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("value must be positive")
     return parsed
 
 
-def build_attention_config(mode: str) -> dict[str, object] | None:
+def _build_attention_config(mode: str) -> dict[str, object] | None:
+    """Build the target-model attention override selected by the example."""
+
     if mode == "auto":
         return None
     if mode == "flash-attn":
@@ -82,19 +86,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dflash-min-eligible-batch",
-        type=positive_int,
+        type=_positive_int,
         default=1,
         help="Skip DFlash unless at least this many decode rows are eligible.",
     )
     parser.add_argument(
         "--dflash-min-proposal-tokens-per-row",
-        type=positive_int,
+        type=_positive_int,
         default=1,
         help="Skip DFlash for rows whose draft width is below this value.",
     )
     parser.add_argument(
         "--dflash-min-proposal-tokens-per-batch",
-        type=positive_int,
+        type=_positive_int,
         default=1,
         help="Skip DFlash unless the eligible rows propose this many tokens.",
     )
@@ -115,43 +119,74 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_dflash_env(args: argparse.Namespace) -> None:
+def _parse_dflash_batch_widths(
+    policy: str,
+    maximum_width: int,
+) -> list[tuple[int, int, int]]:
+    """Convert compact upper-bound syntax to vLLM's dynamic SD schedule."""
+
+    schedule = []
+    range_start = 1
+    for raw_bucket in policy.split(","):
+        upper_text, separator, width_text = raw_bucket.strip().partition(":")
+        if not separator:
+            raise ValueError(
+                "DFlash batch widths must use comma-separated upper_bound:width entries"
+            )
+        range_end = int(upper_text)
+        width = int(width_text)
+        if range_end < range_start:
+            raise ValueError("DFlash batch-width upper bounds must increase")
+        if not 0 <= width <= maximum_width:
+            raise ValueError(
+                f"DFlash batch width must be between zero and {maximum_width}: {width}"
+            )
+        schedule.append((range_start, range_end, width))
+        range_start = range_end + 1
+    return schedule
+
+
+def _build_speculative_config(
+    args: argparse.Namespace,
+) -> dict[str, object] | None:
+    """Build typed NCP DFlash settings without process-global state."""
+
     if not args.draft_model:
-        return
+        return None
     if (
         args.dflash_attention_backend == "flash_varlen"
         and not args.dflash_context_kv_cache
     ):
         raise ValueError("flash_varlen requires the DFlash context KV cache")
 
-    settings = {
-        "NCP_OLMO_DFLASH_VERIFICATION_MODE": args.dflash_verification_mode,
-        "NCP_OLMO_DFLASH_ATTENTION_BACKEND": args.dflash_attention_backend,
-        "NCP_OLMO_DFLASH_CONTEXT_KV_CACHE": str(int(args.dflash_context_kv_cache)),
-        "NCP_OLMO_DFLASH_SPARSE_CONTEXT_PROJECTION": str(
-            int(args.dflash_sparse_context_projection)
-        ),
-        "NCP_OLMO_DFLASH_MIN_ELIGIBLE_BATCH": str(args.dflash_min_eligible_batch),
-        "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_ROW": str(
+    config: dict[str, object] = {
+        "model": args.draft_model,
+        "method": "dflash",
+        "num_speculative_tokens": args.num_speculative_tokens,
+        "ncp_dflash_verification_mode": args.dflash_verification_mode,
+        "ncp_dflash_attention_backend": args.dflash_attention_backend,
+        "ncp_dflash_context_kv_cache": args.dflash_context_kv_cache,
+        "ncp_dflash_sparse_context_projection": (args.dflash_sparse_context_projection),
+        "ncp_dflash_min_eligible_batch": args.dflash_min_eligible_batch,
+        "ncp_dflash_min_proposal_tokens_per_row": (
             args.dflash_min_proposal_tokens_per_row
         ),
-        "NCP_OLMO_DFLASH_MIN_PROPOSAL_TOKENS_PER_BATCH": str(
+        "ncp_dflash_min_proposal_tokens_per_batch": (
             args.dflash_min_proposal_tokens_per_batch
         ),
     }
     if args.dflash_active_batch_widths:
-        settings["NCP_OLMO_DFLASH_ACTIVE_BATCH_WIDTHS"] = (
-            args.dflash_active_batch_widths
+        config["num_speculative_tokens_per_batch_size"] = _parse_dflash_batch_widths(
+            args.dflash_active_batch_widths,
+            args.num_speculative_tokens,
         )
-    os.environ.update(settings)
+    return config
 
 
 def main() -> None:
     args = parse_args()
     if args.flashinfer_sampler:
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
-    configure_dflash_env(args)
-
     from vllm import LLM, SamplingParams
 
     llm = LLM(
@@ -161,16 +196,8 @@ def main() -> None:
         enable_prefix_caching=False,
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
-        attention_config=build_attention_config(args.attention_mode),
-        speculative_config=(
-            {
-                "model": args.draft_model,
-                "method": "dflash",
-                "num_speculative_tokens": args.num_speculative_tokens,
-            }
-            if args.draft_model
-            else None
-        ),
+        attention_config=_build_attention_config(args.attention_mode),
+        speculative_config=_build_speculative_config(args),
         seed=args.seed,
     )
     output = llm.generate(
