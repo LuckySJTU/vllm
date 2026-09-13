@@ -27,7 +27,10 @@ training checkpoint into this standalone HF schema before loading it with vLLM.
 All non-DFlash checkpoints in the public
 [NCP-ArchPreview collection](https://huggingface.co/collections/ArchSpace-Collection/ncp-archpreview)
 are supported, including Stage 1 (and its intermediate checkpoints) and Stage 2
-v1/v2/v3. DFlash checkpoints require the separate DFlash integration.
+v1/v2/v3. The public
+[Stage 2 DFlash2 NCPFlash checkpoint](https://huggingface.co/ArchSpace-Collection/NCP_ArchPreview_dolma3_8.9B_Stage2_DFlash2_NCPFlash)
+is supported only by this DFlash integration and is bound to the Stage 2 v1
+target.
 The model-registry initialization test uses the Stage 2 v1 configuration with
 a contract-preserving layer-count override and vLLM's dummy loader; a separate
 dummy-weight checkpoint is not required.
@@ -86,8 +89,8 @@ weight mappings and numerical parity are validated.
 
 ## NCP DFlash speculative decoding
 
-NCP-OLMo supports its matching self-contained Hugging Face DFlash checkpoint.
-The draft must declare `model_type: "conceptlm_dflash"`, use the
+NCP-ArchPreview supports its matching self-contained Hugging Face DFlash
+checkpoint. The draft must declare `model_type: "conceptlm_dflash"`, use the
 `ConceptLMDFlashModel` architecture, `path_selector` proposals,
 `causal_residual` HLM conditioning, and target-layer IDs compatible with the
 NCP target. Other speculative checkpoints fail closed rather than being sent
@@ -129,10 +132,10 @@ draft during the runner's normal model-loading phase, so its allocation, dummy
 initialization, and peak memory are accounted with the target rather than being
 hidden behind a lazy first request. To reproduce the experimental cross-chunk
 mode, add `--dflash-verification-mode segmented_kv_approx`.
-The downstream-gated adaptive quality preset uses a maximum width of eight and
-caps it by the number of active decode requests: `1 -> 8`, `2 -> 8`, `3-4 -> 4`,
-and `5-8 -> 2`. It remains opt-in because it is paired with the approximate
-cross-chunk state contract:
+An experimental active-batch schedule uses a maximum width of eight and caps it
+by the number of active decode requests: `1 -> 8`, `2 -> 8`, `3-4 -> 4`, and
+`5-8 -> 2`. This is an opt-in performance heuristic for the approximate
+cross-chunk state contract; it is not a quality preset or a checkpoint property:
 
 ```bash
 python examples/offline_inference/ncp_olmo.py /path/to/pure-hf-model \

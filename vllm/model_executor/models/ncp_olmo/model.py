@@ -108,7 +108,7 @@ class NCPOlmo3ForCausalLM(nn.Module, HasInnerState):
         self._ncp_dflash_enabled = is_ncp_dflash_config(vllm_config)
         if vllm_config.speculative_config is not None and not self._ncp_dflash_enabled:
             raise NotImplementedError(
-                "NCP-OLMo only supports its matching conceptlm_dflash checkpoint"
+                "NCP-ArchPreview only supports its matching conceptlm_dflash checkpoint"
             )
         if vllm_config.quant_config is not None:
             raise NotImplementedError(

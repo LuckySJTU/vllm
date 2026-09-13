@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Contract tests for NCP-OLMo's matching DFlash checkpoint."""
+"""Contract tests for NCP-ArchPreview's matching DFlash checkpoint."""
 
 import sys
 from argparse import Namespace
@@ -32,7 +32,10 @@ from vllm.v1.worker.gpu.spec_decode.ncp_dflash import (
     _sdpa_dflash_attention,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+from vllm.v1.worker.gpu.spec_decode.utils import (
+    DraftTokensHandler,
+    should_trim_invalid_draft_suffix,
+)
 
 
 def _create_dflash_block_mask() -> str:
@@ -596,6 +599,14 @@ def test_variable_draft_rows_trim_only_invalid_suffixes() -> None:
 
     assert output.req_ids == ["a", "b", "c"]
     assert output.draft_token_ids == [[11], [], [12, 13]]
+
+
+def test_invalid_suffix_query_is_safe_without_a_speculator() -> None:
+    assert not should_trim_invalid_draft_suffix(None)
+    assert not should_trim_invalid_draft_suffix(SimpleNamespace())
+    assert should_trim_invalid_draft_suffix(
+        SimpleNamespace(variable_draft_lengths=True)
+    )
 
 
 def test_variable_draft_rows_reject_internal_holes() -> None:

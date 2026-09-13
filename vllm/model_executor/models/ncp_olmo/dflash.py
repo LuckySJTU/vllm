@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""NCP-OLMo DFlash configuration and draft-model wrapper."""
+"""NCP-ArchPreview DFlash configuration and draft-model wrapper."""
 
 from __future__ import annotations
 

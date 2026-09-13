@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Pure-HF checkpoint-key adapters and weight contracts for NCP-OLMo."""
+"""Pure-HF checkpoint-key adapters and weight contracts for NCP-ArchPreview."""
 
 from __future__ import annotations
 

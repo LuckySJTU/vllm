@@ -26,6 +26,16 @@ def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
     return load_config
 
 
+def should_trim_invalid_draft_suffix(speculator: object | None) -> bool:
+    """Return whether a speculator emits variable-width ``-1`` suffixes.
+
+    Diffusion models also use the draft-token path but do not construct a
+    speculator, so this query must remain safe for ``None``.
+    """
+
+    return bool(getattr(speculator, "variable_draft_lengths", False))
+
+
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device

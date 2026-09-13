@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Fail-closed configuration contract for the NCP-OLMo vLLM backend."""
+"""Fail-closed configuration contract for the NCP-ArchPreview vLLM backend."""
 
 from __future__ import annotations
 
