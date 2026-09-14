@@ -324,3 +324,84 @@ def test_dflash_continuous_refill_matches_target_only(
 
     assert [len(output) for output in with_dflash] == max_tokens
     assert with_dflash == target_only
+
+
+@pytest.mark.skipif(
+    not DFLASH_MODEL,
+    reason="NCP_OLMO_DFLASH_TEST_MODEL must point to the matching draft checkpoint",
+)
+def test_dflash_preemption_matches_target_only(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_runner,
+) -> None:
+    """Preserve exact target tokens through scheduler recompute preemption."""
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=24,
+        min_tokens=20,
+        logprobs=5,
+    )
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+
+    def generate(
+        speculative_config: dict[str, object] | None,
+    ) -> tuple[list[tuple[list[int], str, Any]], float, float]:
+        with vllm_runner(
+            MODEL,
+            dtype="bfloat16",
+            max_model_len=512,
+            max_num_batched_tokens=48,
+            num_gpu_blocks_override=132,
+            disable_log_stats=False,
+            enforce_eager=True,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            speculative_config=speculative_config,
+            kernel_config={
+                "enable_jit_warmup": False,
+                "enable_cutedsl_warmup": False,
+            },
+        ) as model:
+            metrics_before = model.llm.get_metrics()
+            outputs = model.generate_w_logprobs(
+                PRESSURE_PROMPTS,
+                sampling_params=sampling_params,
+            )
+            metrics_after = model.llm.get_metrics()
+
+        def preemptions(metrics: list[Any]) -> float:
+            return next(
+                (
+                    metric.value
+                    for metric in metrics
+                    if metric.name == "vllm:num_preemptions"
+                ),
+                0,
+            )
+
+        return outputs, preemptions(metrics_before), preemptions(metrics_after)
+
+    target_only, _, _ = generate(None)
+    with_dflash, preemptions_before, preemptions_after = generate(
+        {
+            "model": DFLASH_MODEL,
+            "method": "dflash",
+            "num_speculative_tokens": 8,
+            "num_speculative_tokens_per_batch_size": [
+                (1, 1, 8),
+                (2, 2, 8),
+                (3, 4, 4),
+                (5, 8, 2),
+            ],
+            "ncp_dflash_verification_mode": "sequential_exact",
+        }
+    )
+
+    _check_exact_vllm_outputs(
+        target_only,
+        with_dflash,
+        reference_name="target_only",
+        candidate_name="dflash_preempted",
+    )
+    assert preemptions_after > preemptions_before
