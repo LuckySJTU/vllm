@@ -338,7 +338,7 @@ def test_dflash_preemption_matches_target_only(
 
     sampling_params = SamplingParams(
         temperature=0.0,
-        max_tokens=24,
+        max_tokens=40,
         min_tokens=20,
         logprobs=5,
     )
@@ -351,7 +351,10 @@ def test_dflash_preemption_matches_target_only(
             MODEL,
             dtype="bfloat16",
             max_model_len=512,
-            max_num_batched_tokens=48,
+            # Admit enough short requests concurrently that their decode
+            # growth exhausts the deliberately tiny KV cache even when the
+            # draft model drains requests quickly.
+            max_num_batched_tokens=256,
             num_gpu_blocks_override=132,
             disable_log_stats=False,
             enforce_eager=True,
